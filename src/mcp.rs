@@ -290,6 +290,7 @@ fn call(engine: &Loom, name: &str, args: &Value) -> Result<String, String> {
                 "files": out.stitch.files.len(),
                 "skipped": out.skipped,
                 "lease_expires_in_ms": out.lease.expires_in_ms(loom_now()),
+                "auto_sync": autosync_note(engine, &repo),
             })
             .to_string())
         }
@@ -315,6 +316,7 @@ fn call(engine: &Loom, name: &str, args: &Value) -> Result<String, String> {
                     "cmd": weave.verify.cmd,
                     "landed": false,
                     "reason": reason,
+                    "auto_sync": autosync_note(engine, &repo),
                     "note": "verified green; NOTHING was applied — landing requires a human at a \
                              terminal: run `loom propose` there (it re-runs the verify and asks)",
                 })
@@ -352,6 +354,29 @@ fn call(engine: &Loom, name: &str, args: &Value) -> Result<String, String> {
             .to_string())
         }
         other => Err(format!("unknown tool: {other}")),
+    }
+}
+
+/// Run the repo's opted-in auto-sync (a no-op without `--auto`) and shape
+/// an honest one-line summary; sync failures never fail the local call.
+fn autosync_note(engine: &Loom, repo: &loom::RepoConfig) -> Value {
+    // Re-read the config in case sync flags changed since `repo` was read.
+    let repo = engine
+        .snapshot()
+        .repos
+        .into_iter()
+        .find(|r| r.id == repo.id)
+        .unwrap_or_else(|| repo.clone());
+    match loom::sync::maybe_autosync(engine, &repo) {
+        None => Value::Null,
+        Some(Ok(out)) => json!({
+            "remote": out.remote,
+            "fabric_pulled": out.fabric_pulled,
+            "fabric_pushed": out.fabric_pushed,
+            "cas_refused": out.cas_refused,
+            "cross_machine_toe_steps": out.toe_steps.len(),
+        }),
+        Some(Err(e)) => json!({"failed": e, "note": "local operation unaffected"}),
     }
 }
 
