@@ -7,10 +7,10 @@
 # checker); the library and the installed binary are both still named `loom`.
 [package]
 name = "loom-vcs"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2021"
 license = "MIT"
-description = "Version control for many hands moving at once: intent leases, stitches, and a fabric that is green by construction — a high-frequency collaboration layer above git."
+description = "Version control for many hands moving at once: per-task git worktrees, intent leases, a green-by-construction fabric with honest file-level merges, orphan adoption, and multi-machine sync over any git remote."
 repository = "https://github.com/zyads/loom-vcs"
 
 [lib]

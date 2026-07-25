@@ -58,6 +58,12 @@ pub fn objects_dir(base: &Path, repo_id: &str) -> PathBuf {
     base.join(repo_id).join("objects")
 }
 
+/// Where isolated threads' git worktrees live: outside the repo's own tree,
+/// so they never appear in anyone's scope, stitch or git status.
+pub fn worktrees_dir(base: &Path, repo_id: &str) -> PathBuf {
+    base.join(repo_id).join("worktrees")
+}
+
 /// Load the whole picture: registry + one state per registered repo. Any
 /// unreadable or corrupt file degrades to its default — Loom would rather
 /// start an empty repo state than refuse to start.

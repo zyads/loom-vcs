@@ -6,16 +6,21 @@
 //!
 //! Git detects collisions at merge time, hours after the toes were stepped
 //! on; leaves crashed agents' work as unowned dirty worktrees; and makes
-//! "green main" a snapshot, not an invariant. Loom is the high-frequency
-//! collaboration layer that sits above git: agents declare **intent leases**
-//! before touching files, checkpoint **stitches** every few seconds, and land
-//! on the shared **fabric** only through a **weave gate** that verifies green
-//! first. Crashed work becomes an adoptable **orphan**, never a mess.
-//!
-//! **v1 is single-machine**: multiple local agent sessions collaborating
-//! through one shared data directory. Peer-to-peer gossip is out of scope —
-//! but every object here carries a stable id and serializes cleanly so the
-//! same model can gossip later over a peer transport.
+//! "green main" a snapshot, not an invariant. Loom is the coordination
+//! layer that sits above git: each task runs in its **own git worktree**
+//! (isolation — two threads physically cannot clobber each other), declares
+//! an **intent lease** before touching files (coordination — collisions
+//! warn at declaration time, when they are cheap), checkpoints **stitches**
+//! every few seconds (deletions tracked as tombstones), and lands on the
+//! shared **fabric** only through a **weave gate** that verifies green in a
+//! scratch copy and MERGES at file level — a file changed in both the
+//! fabric and the thread refuses the land with an honest "fabric moved
+//! under you — rebase" instead of overwriting either side. Crashed work
+//! becomes an adoptable **orphan**, never a mess. The [`sync`] module
+//! extends all of it across machines over any shared git remote: state
+//! rides hidden `refs/loom/*` refs, and fabric authority is a
+//! compare-and-swap ref push — git's atomic ref update is the shuttle
+//! token.
 //!
 //! **The trust boundary, stated plainly:**
 //!
@@ -23,12 +28,17 @@
 //!   live lease SUCCEEDS — the collision is surfaced the moment it is cheap,
 //!   as a recorded `toe_step` warning carrying both goals and a suggested
 //!   split. Nothing in Loom ever blocks an agent from working.
-//! * **A stitch only READS.** Capturing a stitch walks the leased scope and
-//!   snapshots file contents into a content-addressed store under the data
-//!   dir. It never writes into the repo.
+//! * **A thread edits its own worktree, not the repo.** Isolated threads
+//!   (the default on git repos) get a detached worktree under the loom data
+//!   dir; the repo tree changes only when a weave lands, through the merge
+//!   rules above. In-place mode (`--in-place`, or a non-git repo) keeps the
+//!   old direct-edit behavior, honestly labeled.
+//! * **A stitch only READS.** Capturing a stitch walks the leased scope in
+//!   the thread's working dir and snapshots file contents (and deletions)
+//!   into a content-addressed store under the data dir.
 //! * **The weave gate verifies in a scratch copy, never in the real tree.**
-//!   `propose` copies the repo to a scratch dir, overlays the thread's head
-//!   stitch, and runs the repo's verify command there. Red never lands — the
+//!   `propose` copies the repo to a scratch dir, overlays the thread's
+//!   delta, and runs the repo's verify command there. Red never lands — the
 //!   failure is recorded and the thread stays active.
 //! * **Applying a green weave to the real working tree is an ACTION.** It
 //!   requires an explicit human yes, expressed through the
@@ -41,25 +51,27 @@
 //!   `git_bridge: true`, a landed weave becomes one local commit on the
 //!   current branch, message composed from the lease goal + criteria +
 //!   verify result. Per-thread draft-branch export is future work.
+//! * **Sync is explicit and says what it shares.** `loom sync` publishes
+//!   lease/thread metadata AND scoped file blobs to the configured remote —
+//!   the same exposure as pushing a branch there; `--auto` is a per-repo
+//!   opt-in. Objects are unsigned in this version (machine ids are
+//!   identity, not authentication); a `sig` field slots in via serde
+//!   default without a format break.
 //!
 //! Storage is "boring on purpose": a JSON state file plus an append-only
 //! JSONL event log per repo under `<data dir>/<repo_id>/` (default `~/.loom`,
 //! overridable via the `LOOM_DATA` env var or [`Loom::at`]), 0o600, bounded,
 //! corrupt-line tolerant, and a content-addressed blob store (whole files
 //! keyed by sha256; rolling-hash chunking is future work).
-//!
-//! TODO(federation): gossip logs over a peer transport; sign every object
-//! with a per-machine key (a `sig` field slots in via serde default without
-//! a format break); rotate the shuttle token for fabric advancement among
-//! live peers. None of that is built here — v1 has exactly one peer: this
-//! machine.
 
 pub mod bridge;
 pub mod consent;
 pub mod lease;
 pub mod solo;
 pub mod store;
+pub mod sync;
 pub mod weave;
+pub mod worktree;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -82,6 +94,12 @@ pub const MAX_TTL_MS: u64 = 24 * 3600 * 1000;
 
 /// Verify command when the repo registration does not pick one.
 pub const DEFAULT_VERIFY_CMD: &str = "cargo check";
+
+/// The manifest value that records a deletion: a thread that deleted a
+/// scoped file carries this instead of a content hash, and applying it
+/// removes the file. Deliberately not 64 hex chars, so it can never collide
+/// with a real content hash (and `read_blob` refuses it outright).
+pub const TOMBSTONE: &str = "deleted";
 
 /// Caps on stored text and collection sizes.
 pub const MAX_GOAL_CHARS: usize = 300;
@@ -114,6 +132,15 @@ pub struct RepoConfig {
     #[serde(default)]
     pub git_bridge: bool,
     pub registered_ms: u64,
+    /// The git remote `loom sync` talks to, remembered from the first
+    /// `loom sync --remote <name>`. `None` = this repo has never synced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync_remote: Option<String>,
+    /// When true (explicit opt-in: `loom sync --auto`), stitch and propose
+    /// also sync — sharing lease/thread metadata AND scoped file blobs with
+    /// the remote, the same exposure as pushing a branch there.
+    #[serde(default)]
+    pub auto_sync: bool,
 }
 
 /// An intent lease: "I am about to touch these paths, for this goal."
@@ -151,8 +178,11 @@ impl Lease {
 }
 
 /// A micro-snapshot of the leased scope: `files` maps repo-relative path →
-/// content hash in the blob store. Unchanged files dedup for free (same
-/// hash, same blob); an unchanged *manifest* creates no new stitch at all.
+/// content hash in the blob store, or [`TOMBSTONE`] for a file the thread
+/// deleted (detected against the previous stitch and the thread's base
+/// snapshot — a first stitch with neither reference cannot see deletions).
+/// Unchanged files dedup for free (same hash, same blob); an unchanged
+/// *manifest* creates no new stitch at all.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Stitch {
     pub id: String,
@@ -207,6 +237,25 @@ pub struct Thread {
     /// withdrawn / mid-gate).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_id: Option<String>,
+    /// Absolute path of this thread's isolated git worktree — where the
+    /// holder edits. `None` means in-place (v0.1 behavior): the thread edits
+    /// the repo's own tree directly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<String>,
+    /// The stitch snapshotting the fabric state this thread branched from
+    /// (its scope, captured when the worktree was created and refreshed by
+    /// `rebase`). Present exactly for isolated threads; the three-way merge
+    /// rules at land compare head vs THIS vs the live repo tree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_stitch: Option<String>,
+}
+
+impl Thread {
+    /// Where this thread's work happens: its worktree when isolated, else
+    /// the repo root.
+    pub fn working_dir<'a>(&'a self, repo_path: &'a str) -> &'a str {
+        self.worktree.as_deref().unwrap_or(repo_path)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -238,6 +287,11 @@ pub struct Weave {
     pub fabric_parent: Option<String>,
     pub verify: VerifyOutcome,
     pub ts_ms: u64,
+    /// Exactly what landing applied to the tree (path → content hash or
+    /// [`TOMBSTONE`]). Empty until the weave lands. This is what `loom sync`
+    /// publishes so other machines can replay the same change.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub applied: BTreeMap<String, String>,
 }
 
 /// The shared line. `tip` advances only in [`Loom::land_weave`], whose
@@ -274,6 +328,25 @@ pub struct ToeStep {
 // State
 // ---------------------------------------------------------------------------
 
+/// What one peer machine last published about this repo, cached locally by
+/// `loom sync` so `loom status` can show the whole team without touching
+/// the network. Peers' threads and leases stay in THEIR state — this is a
+/// read-only view, refreshed on every sync; cross-machine orphans import
+/// into local state only through the claims flow in [`sync`].
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct PeerSnapshot {
+    pub machine: String,
+    /// When the peer published this state (its clock).
+    pub ts_ms: u64,
+    /// When we fetched it (our clock).
+    #[serde(default)]
+    pub fetched_ms: u64,
+    #[serde(default)]
+    pub threads: Vec<Thread>,
+    #[serde(default)]
+    pub leases: Vec<Lease>,
+}
+
 /// Everything Loom knows about one repo. Persisted as
 /// `<data dir>/<repo_id>/state.json`; every mutation also appends to the
 /// repo's `log.jsonl`.
@@ -291,6 +364,8 @@ pub struct RepoState {
     pub toe_steps: Vec<ToeStep>,
     #[serde(default)]
     pub fabric: Fabric,
+    #[serde(default)]
+    pub peers: Vec<PeerSnapshot>,
     #[serde(default)]
     pub seq: u64,
 }
@@ -336,13 +411,51 @@ pub fn default_data_dir() -> PathBuf {
     }
 }
 
+/// How a new lease's thread relates to the working tree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IsolationMode {
+    /// Isolated when the repo is a git repo (falling back to in-place, with
+    /// the reason noted on the thread, if worktree setup fails); in-place
+    /// otherwise. The default.
+    Auto,
+    /// Require a worktree; the declaration FAILS if one cannot be created.
+    Isolated,
+    /// v0.1 behavior: the thread edits the repo tree directly.
+    InPlace,
+}
+
 /// What `declare_lease` hands back: the lease, its thread, and any toe-step
-/// warnings — declaration succeeded either way.
+/// warnings — declaration succeeded either way. `working_dir` is where the
+/// holder must edit: the thread's own worktree when isolated, else the repo
+/// root.
 #[derive(Clone, Debug)]
 pub struct DeclareOutcome {
     pub lease: Lease,
     pub thread: Thread,
     pub toe_steps: Vec<ToeStep>,
+    pub working_dir: String,
+}
+
+/// What `rebase_thread` hands back: which files were fast-forwarded from
+/// the fabric into the worktree, and which conflicted (changed in BOTH the
+/// fabric and the thread — the worktree keeps the thread's version, and the
+/// holder is told to review before re-proposing). `approval_id` is any
+/// parked approval that was gating the thread, handed back so an embedding
+/// host can resolve it.
+#[derive(Clone, Debug)]
+pub struct RebaseOutcome {
+    pub thread: Thread,
+    pub fast_forwarded: Vec<String>,
+    pub conflicts: Vec<String>,
+    pub approval_id: Option<String>,
+}
+
+/// What `clean_worktrees` hands back: worktrees removed (thread id, path),
+/// and worktrees kept with the honest reason.
+#[derive(Clone, Debug, Default)]
+pub struct CleanReport {
+    pub removed: Vec<(String, String)>,
+    pub skipped: Vec<(String, String)>,
 }
 
 /// What `stitch` hands back. `unchanged` means the manifest was identical to
@@ -452,6 +565,8 @@ impl Loom {
                 verify_cmd: cmd.clone(),
                 git_bridge,
                 registered_ms: now_ms(),
+                sync_remote: None,
+                auto_sync: false,
             };
             s.repos.push(repo.clone());
             let mut rs = RepoState::default();
@@ -463,6 +578,42 @@ impl Loom {
                 &serde_json::json!({
                     "ts_ms": now_ms(), "kind": "repo_registered",
                     "path": canon_str, "verify_cmd": cmd, "git_bridge": git_bridge,
+                }),
+            );
+            Ok(repo)
+        })
+    }
+
+    /// Remember this repo's sync remote and auto-sync opt-in (set by
+    /// `loom sync --remote <name>` / `--auto`). Auto-sync is explicit
+    /// consent to share lease/thread metadata AND scoped file blobs with
+    /// that remote on every stitch/propose — the same exposure as pushing a
+    /// branch there.
+    pub fn set_sync(
+        &self,
+        repo_id: &str,
+        remote: Option<String>,
+        auto: Option<bool>,
+    ) -> Result<RepoConfig, String> {
+        self.with(|s, base| {
+            let repo = s
+                .repos
+                .iter_mut()
+                .find(|r| r.id == repo_id)
+                .ok_or_else(|| format!("no registered repo with id {repo_id}"))?;
+            if let Some(r) = remote {
+                repo.sync_remote = Some(r);
+            }
+            if let Some(a) = auto {
+                repo.auto_sync = a;
+            }
+            let repo = repo.clone();
+            store::append_event(
+                base,
+                repo_id,
+                &serde_json::json!({
+                    "ts_ms": now_ms(), "kind": "sync_configured",
+                    "remote": repo.sync_remote, "auto": repo.auto_sync,
                 }),
             );
             Ok(repo)
@@ -492,6 +643,11 @@ impl Loom {
     /// Declare an intent lease (creates its thread). Scope globs are
     /// validated; overlap with live leases is detected and returned as
     /// toe-step warnings — the declaration still succeeds.
+    ///
+    /// Isolation is [`IsolationMode::Auto`]: when the repo is a git repo the
+    /// thread gets its own worktree (edit THERE — `working_dir` on the
+    /// outcome); otherwise it works in place. Use [`Loom::declare_lease_mode`]
+    /// to pick explicitly.
     pub fn declare_lease(
         &self,
         repo_id: &str,
@@ -500,6 +656,24 @@ impl Loom {
         scope: Vec<String>,
         criteria: Vec<String>,
         ttl_ms: Option<u64>,
+    ) -> Result<DeclareOutcome, String> {
+        self.declare_lease_mode(repo_id, holder, goal, scope, criteria, ttl_ms, IsolationMode::Auto)
+    }
+
+    /// [`Loom::declare_lease`] with the isolation mode explicit. Blocking
+    /// when isolation applies (a `git worktree add` plus a scope walk to
+    /// snapshot the thread's base); call from a blocking-task helper on
+    /// async paths.
+    #[allow(clippy::too_many_arguments)]
+    pub fn declare_lease_mode(
+        &self,
+        repo_id: &str,
+        holder: &str,
+        goal: &str,
+        scope: Vec<String>,
+        criteria: Vec<String>,
+        ttl_ms: Option<u64>,
+        mode: IsolationMode,
     ) -> Result<DeclareOutcome, String> {
         let goal = cap(goal, MAX_GOAL_CHARS);
         if goal.is_empty() {
@@ -517,10 +691,14 @@ impl Loom {
             .clamp(MIN_TTL_MS, MAX_TTL_MS);
         let holder = cap(holder, MAX_GOAL_CHARS);
         let now = now_ms();
-        self.with(|s, base| {
-            if !s.repos.iter().any(|r| r.id == repo_id) {
-                return Err(format!("no registered repo with id {repo_id}"));
-            }
+        // Phase 1 (locked): validate, detect toe-steps, insert lease+thread.
+        let (mut out, repo) = self.with(|s, base| {
+            let repo = s
+                .repos
+                .iter()
+                .find(|r| r.id == repo_id)
+                .cloned()
+                .ok_or_else(|| format!("no registered repo with id {repo_id}"))?;
             reconcile_repo(s, repo_id, now, base);
             let rs = s.repo_states.entry(repo_id.to_string()).or_default();
             rs.seq += 1;
@@ -545,6 +723,8 @@ impl Loom {
                 status: ThreadStatus::Active,
                 note: String::new(),
                 approval_id: None,
+                worktree: None,
+                base_stitch: None,
             };
             // Overlap check against every other live lease, BEFORE inserting
             // ours, so we never compare a lease against itself.
@@ -571,12 +751,110 @@ impl Loom {
                     "thread": thread.id, "goal": goal, "scope": scope,
                 }),
             );
-            Ok(DeclareOutcome {
-                lease,
-                thread,
-                toe_steps,
-            })
-        })
+            let working_dir = repo.path.clone();
+            Ok::<_, String>((
+                DeclareOutcome {
+                    lease,
+                    thread,
+                    toe_steps,
+                    working_dir,
+                },
+                repo,
+            ))
+        })?;
+        let isolate = match mode {
+            IsolationMode::InPlace => false,
+            IsolationMode::Isolated => true,
+            IsolationMode::Auto => worktree::is_git_repo(std::path::Path::new(&repo.path)),
+        };
+        if !isolate {
+            return Ok(out);
+        }
+        // Phase 2 (unlocked): add the worktree (detached at git HEAD), then
+        // ALIGN its scope to the repo's live tree — the fabric may be ahead
+        // of HEAD (landed weaves sit in the working tree until committed).
+        // What the repo has right now becomes the thread's base: the state
+        // the merge rules at land compare against.
+        let wt_dir = store::worktrees_dir(&self.base(), &repo.id).join(&out.thread.id);
+        let objects = store::objects_dir(&self.base(), &repo.id);
+        let setup = worktree::add(std::path::Path::new(&repo.path), &wt_dir).and_then(|()| {
+            weave::align_tree(
+                std::path::Path::new(&repo.path),
+                &wt_dir,
+                &out.lease.scope,
+                &objects,
+            )
+        });
+        // Phase 3 (locked): record isolation — or fall back / roll back.
+        match setup {
+            Ok(captured) => {
+                let wt_str = wt_dir.to_string_lossy().to_string();
+                let updated = self.with(|s, base| {
+                    let rs = s.repo_states.get_mut(repo_id)?;
+                    rs.seq += 1;
+                    let base_stitch = Stitch {
+                        id: format!("stitch-{}-{}", now_ms(), rs.seq),
+                        thread_id: out.thread.id.clone(),
+                        parent: None,
+                        files: captured.manifest.clone(),
+                        ts_ms: now_ms(),
+                    };
+                    rs.stitches.push(base_stitch.clone());
+                    let t = rs.threads.iter_mut().find(|t| t.id == out.thread.id)?;
+                    t.worktree = Some(wt_str.clone());
+                    t.base_stitch = Some(base_stitch.id.clone());
+                    store::append_event(
+                        base,
+                        repo_id,
+                        &serde_json::json!({
+                            "ts_ms": now_ms(), "kind": "worktree_created",
+                            "thread": t.id, "path": wt_str, "base_stitch": base_stitch.id,
+                        }),
+                    );
+                    Some(t.clone())
+                });
+                if let Some(t) = updated {
+                    out.thread = t;
+                    out.working_dir = wt_dir.to_string_lossy().to_string();
+                }
+                Ok(out)
+            }
+            Err(e) => {
+                let _ = worktree::remove(std::path::Path::new(&repo.path), &wt_dir);
+                if mode == IsolationMode::Isolated {
+                    // The caller demanded isolation: undo the declaration.
+                    self.with(|s, base| {
+                        if let Some(rs) = s.repo_states.get_mut(repo_id) {
+                            rs.leases.retain(|l| l.id != out.lease.id);
+                            rs.threads.retain(|t| t.id != out.thread.id);
+                            rs.toe_steps.retain(|t| t.lease_a != out.lease.id);
+                        }
+                        store::append_event(
+                            base,
+                            repo_id,
+                            &serde_json::json!({
+                                "ts_ms": now_ms(), "kind": "lease_rolled_back",
+                                "lease": out.lease.id, "reason": e,
+                            }),
+                        );
+                    });
+                    return Err(format!(
+                        "isolated lease refused — worktree setup failed: {e}"
+                    ));
+                }
+                // Auto: degrade honestly to in-place, reason on the thread.
+                let note = format!("isolation unavailable ({}) — working in place", cap(&e, 160));
+                self.with(|s, _| {
+                    if let Some(rs) = s.repo_states.get_mut(repo_id) {
+                        if let Some(t) = rs.threads.iter_mut().find(|t| t.id == out.thread.id) {
+                            t.note = note.clone();
+                        }
+                    }
+                });
+                out.thread.note = note;
+                Ok(out)
+            }
+        }
     }
 
     /// Renew a lease. Refused once the thread is orphaned — adopt instead.
@@ -633,13 +911,16 @@ impl Loom {
     // -- stitches -----------------------------------------------------------
 
     /// Capture a stitch: snapshot the current content of files matching the
-    /// lease scope under the repo root. The server reads the files itself —
-    /// callers never upload content. Blocking (file walk + hashing); call
-    /// from `spawn_blocking` on async paths.
+    /// lease scope under the thread's working directory — its isolated
+    /// worktree when it has one, else the repo root. The server reads the
+    /// files itself — callers never upload content. Files present in the
+    /// previous stitch (or the thread's base) but gone from disk are
+    /// recorded as [`TOMBSTONE`] deletions. Blocking (file walk + hashing);
+    /// call from `spawn_blocking` on async paths.
     pub fn stitch(&self, lease_id: &str) -> Result<StitchOutcome, String> {
         let now = now_ms();
-        // Phase 1 (locked): resolve lease → repo path + scope + parent.
-        let (repo, lease, thread_id, parent) = self.with(|s, base| {
+        // Phase 1 (locked): resolve lease → capture root + scope + parent.
+        let (repo, lease, thread_id, parent, root, base_manifest) = self.with(|s, base| {
             let repo_id = find_repo_of_lease(s, lease_id)
                 .ok_or_else(|| format!("no lease with id {lease_id}"))?;
             reconcile_repo(s, &repo_id, now, base);
@@ -662,23 +943,52 @@ impl Loom {
                 .as_ref()
                 .and_then(|id| rs.stitches.iter().find(|st| st.id == *id))
                 .cloned();
+            let base_manifest = thread
+                .base_stitch
+                .as_ref()
+                .and_then(|id| rs.stitches.iter().find(|st| st.id == *id))
+                .map(|st| st.files.clone());
             let repo = s
                 .repos
                 .iter()
                 .find(|r| r.id == repo_id)
                 .cloned()
                 .ok_or_else(|| format!("repo {repo_id} vanished from the registry"))?;
-            Ok((repo, lease.clone(), lease.thread_id.clone(), parent))
+            let root = thread.working_dir(&repo.path).to_string();
+            if thread.worktree.is_some() && !std::path::Path::new(&root).is_dir() {
+                return Err(format!(
+                    "thread {}'s worktree is missing ({root}) — it was removed outside loom; \
+                     re-lease to start a fresh one",
+                    thread.id
+                ));
+            }
+            Ok((repo, lease.clone(), lease.thread_id.clone(), parent, root, base_manifest))
         })?;
         // Phase 2 (unlocked): walk + hash + write blobs.
         let objects = store::objects_dir(&self.base(), &repo.id);
-        let captured =
-            weave::capture_scope(std::path::Path::new(&repo.path), &lease.scope, &objects)?;
+        let captured = weave::capture_scope(std::path::Path::new(&root), &lease.scope, &objects)?;
+        // Deletions: anything the previous stitch or the base knew about
+        // that no longer exists on disk becomes a tombstone. A parent's
+        // tombstone carries forward until the file reappears.
+        let mut manifest = captured.manifest.clone();
+        let reference = parent
+            .as_ref()
+            .map(|p| p.files.clone())
+            .or_else(|| base_manifest.clone());
+        if let Some(reference) = &reference {
+            for rel in reference.keys() {
+                manifest
+                    .entry(rel.clone())
+                    .or_insert_with(|| TOMBSTONE.to_string());
+            }
+        }
         // Phase 3 (locked): record the stitch (or report "unchanged").
         self.with(|s, base| {
             let rs = s.repo_states.get_mut(&repo.id).expect("repo state exists");
+            // Unchanged vs the parent — or, for a first stitch of an
+            // isolated thread, vs its base snapshot: no new stitch.
             if let Some(p) = &parent {
-                if p.files == captured.manifest {
+                if p.files == manifest {
                     return Ok(StitchOutcome {
                         stitch: p.clone(),
                         unchanged: true,
@@ -686,13 +996,31 @@ impl Loom {
                         lease: lease.clone(),
                     });
                 }
+            } else if let Some(b) = &base_manifest {
+                if *b == manifest {
+                    let base_id = rs
+                        .threads
+                        .iter()
+                        .find(|t| t.id == thread_id)
+                        .and_then(|t| t.base_stitch.clone())
+                        .and_then(|id| rs.stitches.iter().find(|st| st.id == id))
+                        .cloned();
+                    if let Some(bs) = base_id {
+                        return Ok(StitchOutcome {
+                            stitch: bs,
+                            unchanged: true,
+                            skipped: captured.skipped,
+                            lease: lease.clone(),
+                        });
+                    }
+                }
             }
             rs.seq += 1;
             let stitch = Stitch {
                 id: format!("stitch-{now}-{}", rs.seq),
                 thread_id: thread_id.clone(),
                 parent: parent.as_ref().map(|p| p.id.clone()),
-                files: captured.manifest.clone(),
+                files: manifest.clone(),
                 ts_ms: now,
             };
             rs.stitches.push(stitch.clone());
@@ -733,7 +1061,97 @@ impl Loom {
     /// Adopt an orphaned thread: the new holder takes over the SAME lease
     /// (fresh TTL and heartbeat), so goal, criteria and scope are preserved
     /// exactly. Thread → Adopted, which has Active semantics.
+    ///
+    /// The dead holder's worktree is handed over as-is (its path rides on
+    /// the returned thread). An orphan WITHOUT a worktree — an in-place
+    /// thread, or one imported from another machine — gets a fresh one on a
+    /// git repo: worktree at HEAD, base snapshotted, the orphan's head
+    /// stitch overlaid, so the adopter continues the work isolated. Falls
+    /// back to in-place (noted) when that setup fails.
     pub fn adopt(&self, thread_id: &str, holder: &str) -> Result<(Thread, Lease), String> {
+        let (thread, lease) = self.adopt_locked(thread_id, holder)?;
+        if thread.worktree.is_some() {
+            return Ok((thread, lease));
+        }
+        // Post-step (unlocked): try to give the adopter isolation.
+        let repo = self.with(|s, _| {
+            s.repos
+                .iter()
+                .find(|r| r.id == thread.repo_id)
+                .cloned()
+        });
+        let Some(repo) = repo else { return Ok((thread, lease)) };
+        if !worktree::is_git_repo(std::path::Path::new(&repo.path)) {
+            return Ok((thread, lease));
+        }
+        let wt_dir = store::worktrees_dir(&self.base(), &repo.id).join(&thread.id);
+        let objects = store::objects_dir(&self.base(), &repo.id);
+        let head_manifest = self.with(|s, _| {
+            s.repo_states.get(&repo.id).and_then(|rs| {
+                thread
+                    .head_stitch
+                    .as_ref()
+                    .and_then(|id| rs.stitches.iter().find(|st| st.id == *id))
+                    .map(|st| st.files.clone())
+            })
+        });
+        let setup = worktree::add(std::path::Path::new(&repo.path), &wt_dir)
+            .and_then(|()| {
+                // Base = the repo's LIVE tree (the fabric), not git HEAD.
+                weave::align_tree(std::path::Path::new(&repo.path), &wt_dir, &lease.scope, &objects)
+            })
+            .and_then(|base_cap| {
+                if let Some(m) = &head_manifest {
+                    weave::apply_overlay(&wt_dir, m, &objects)?;
+                }
+                Ok(base_cap)
+            });
+        match setup {
+            Ok(base_cap) => {
+                let wt_str = wt_dir.to_string_lossy().to_string();
+                let updated = self.with(|s, base| {
+                    let rs = s.repo_states.get_mut(&repo.id)?;
+                    rs.seq += 1;
+                    let base_stitch = Stitch {
+                        id: format!("stitch-{}-{}", now_ms(), rs.seq),
+                        thread_id: thread.id.clone(),
+                        parent: None,
+                        files: base_cap.manifest.clone(),
+                        ts_ms: now_ms(),
+                    };
+                    rs.stitches.push(base_stitch.clone());
+                    let t = rs.threads.iter_mut().find(|t| t.id == thread.id)?;
+                    t.worktree = Some(wt_str.clone());
+                    t.base_stitch = Some(base_stitch.id.clone());
+                    store::append_event(
+                        base,
+                        &repo.id,
+                        &serde_json::json!({
+                            "ts_ms": now_ms(), "kind": "worktree_created",
+                            "thread": t.id, "path": wt_str, "on": "adopt",
+                        }),
+                    );
+                    Some(t.clone())
+                });
+                Ok((updated.unwrap_or(thread), lease))
+            }
+            Err(e) => {
+                let _ = worktree::remove(std::path::Path::new(&repo.path), &wt_dir);
+                let note =
+                    format!("isolation unavailable ({}) — working in place", cap(&e, 160));
+                let updated = self.with(|s, _| {
+                    s.repo_states.get_mut(&repo.id).and_then(|rs| {
+                        let t = rs.threads.iter_mut().find(|t| t.id == thread.id)?;
+                        t.note = note.clone();
+                        Some(t.clone())
+                    })
+                });
+                Ok((updated.unwrap_or(thread), lease))
+            }
+        }
+    }
+
+    fn adopt_locked(&self, thread_id: &str, holder: &str) -> Result<(Thread, Lease), String> {
         let now = now_ms();
         let holder = cap(holder, MAX_GOAL_CHARS);
         self.with(|s, base| {
@@ -822,6 +1240,7 @@ impl Loom {
                 .head_stitch
                 .clone()
                 .ok_or_else(|| "nothing to weave — capture a stitch first".to_string())?;
+            let base_stitch = thread.base_stitch.clone();
             let manifest = rs
                 .stitches
                 .iter()
@@ -830,6 +1249,20 @@ impl Loom {
                 .ok_or_else(|| format!("head stitch {head} not found"))?;
             thread.status = ThreadStatus::Proposed;
             thread.note = "verify running".into();
+            // Isolated threads verify their DELTA vs base overlaid on the
+            // live repo tree (the fabric's materialization) — exactly the
+            // state a land would produce. In-place threads overlay the whole
+            // manifest (v0.1 behavior; their tree IS the repo tree).
+            let manifest = match base_stitch
+                .and_then(|id| rs.stitches.iter().find(|st| st.id == id))
+                .map(|st| &st.files)
+            {
+                Some(base) => manifest
+                    .into_iter()
+                    .filter(|(rel, h)| base.get(rel) != Some(h))
+                    .collect(),
+                None => manifest,
+            };
             Ok((repo, manifest))
         })?;
         // Phase 2 (unlocked): scratch worktree + verify. A failure to even
@@ -847,6 +1280,7 @@ impl Loom {
                 fabric_parent: rs.fabric.tip.clone(),
                 verify: verify.clone(),
                 ts_ms: now_ms(),
+                applied: BTreeMap::new(),
             };
             rs.weaves.push(weave.clone());
             let thread = rs
@@ -927,16 +1361,58 @@ impl Loom {
                     "fabric advanced since this weave's verify — re-propose the thread".into(),
                 );
             }
-            let manifest = rs
-                .stitches
+            let (head_id, base_id) = rs
+                .threads
                 .iter()
-                .rev()
-                .find(|st| st.thread_id == weave.thread_id)
+                .find(|t| t.id == weave.thread_id)
+                .map(|t| (t.head_stitch.clone(), t.base_stitch.clone()))
+                .ok_or_else(|| format!("thread {} vanished", weave.thread_id))?;
+            let manifest = head_id
+                .and_then(|id| rs.stitches.iter().find(|st| st.id == id))
                 .map(|st| st.files.clone())
                 .ok_or_else(|| "thread's stitches are gone; cannot apply".to_string())?;
+            let base_manifest = base_id
+                .and_then(|id| rs.stitches.iter().find(|st| st.id == id))
+                .map(|st| st.files.clone());
+            // Isolated threads MERGE at file level: only files the thread
+            // actually changed vs its base are applied, and a file that
+            // moved in BOTH the fabric and the thread refuses the land —
+            // never silently overwriting either side. In-place threads
+            // (no base) apply the whole manifest, v0.1 behavior.
+            let (apply_manifest, conflicts) = weave::merge_plan(
+                std::path::Path::new(&repo.path),
+                &manifest,
+                base_manifest.as_ref(),
+            );
+            if !conflicts.is_empty() {
+                let list = cap(&conflicts.join(", "), MAX_GOAL_CHARS);
+                let note = format!(
+                    "fabric moved under you on {list} — `loom rebase`, then re-propose"
+                );
+                if let Some(t) = rs.threads.iter_mut().find(|t| t.id == weave.thread_id) {
+                    t.note = note.clone();
+                }
+                store::append_event(
+                    base,
+                    &repo_id,
+                    &serde_json::json!({
+                        "ts_ms": now, "kind": "weave_conflict", "weave": weave.id,
+                        "thread": weave.thread_id, "files": conflicts,
+                    }),
+                );
+                return Err(format!(
+                    "fabric moved under you on {list} — rebase the thread \
+                     (`loom rebase`) and re-propose"
+                ));
+            }
             let objects = store::objects_dir(base, &repo_id);
             let applied =
-                weave::apply_overlay(std::path::Path::new(&repo.path), &manifest, &objects)?;
+                weave::apply_overlay(std::path::Path::new(&repo.path), &apply_manifest, &objects)?;
+            let mut weave = weave;
+            weave.applied = apply_manifest;
+            if let Some(w) = rs.weaves.iter_mut().find(|w| w.id == weave_id) {
+                w.applied = weave.applied.clone();
+            }
             rs.fabric.tip = Some(weave.id.clone());
             rs.fabric.history.push(weave.id.clone());
             let mut criteria = Vec::new();
@@ -1097,6 +1573,327 @@ impl Loom {
         })
     }
 
+    // -- rebase & worktree hygiene ------------------------------------------
+
+    /// Refresh an isolated thread's worktree from the fabric tip (the live
+    /// repo tree). File-level, three-way against the thread's base:
+    ///
+    /// * **fabric-only** changes are fast-forwarded into the worktree
+    ///   (copies — and deletions, when the fabric deleted a file the thread
+    ///   never touched);
+    /// * **thread-only** changes are kept;
+    /// * files changed in **both** keep the THREAD's version and come back
+    ///   as `conflicts` — the holder is told to review them against the
+    ///   repo tree before re-proposing. Nothing merges silently.
+    ///
+    /// The base is re-snapshotted to the fabric's current state and the head
+    /// stitch re-captured, so the next propose/land measures purely against
+    /// the new base. A Proposed thread returns to Active (its old verify is
+    /// moot); any parked approval id is handed back for the host to resolve.
+    /// Blocking (two scope walks); use a blocking-task helper on async paths.
+    pub fn rebase_thread(&self, thread_id: &str) -> Result<RebaseOutcome, String> {
+        let now = now_ms();
+        // Phase 1 (locked): resolve thread → worktree, scope, base manifest.
+        let (repo, wt_path, scope, base_manifest, old_head) = self.with(|s, base| {
+            let repo_id = find_repo_of_thread(s, thread_id)
+                .ok_or_else(|| format!("no thread with id {thread_id}"))?;
+            reconcile_repo(s, &repo_id, now, base);
+            let repo = s
+                .repos
+                .iter()
+                .find(|r| r.id == repo_id)
+                .cloned()
+                .ok_or_else(|| format!("repo {repo_id} vanished from the registry"))?;
+            let rs = s.repo_states.get(&repo_id).expect("repo state exists");
+            let thread = rs
+                .threads
+                .iter()
+                .find(|t| t.id == thread_id)
+                .ok_or_else(|| format!("no thread with id {thread_id}"))?;
+            if !thread.status.is_live() {
+                return Err(format!(
+                    "thread {} is {:?} — only a live thread can rebase (adopt an orphan first)",
+                    thread_id, thread.status
+                ));
+            }
+            let wt = thread.worktree.clone().ok_or_else(|| {
+                "this thread works in place — it follows the fabric directly; nothing to rebase"
+                    .to_string()
+            })?;
+            if !std::path::Path::new(&wt).is_dir() {
+                return Err(format!("worktree {wt} is missing — re-lease to start fresh"));
+            }
+            let scope = thread
+                .lease_id
+                .as_ref()
+                .and_then(|lid| rs.leases.iter().find(|l| l.id == *lid))
+                .map(|l| l.scope.clone())
+                .ok_or_else(|| format!("thread {thread_id} lost its lease record"))?;
+            let base_manifest = thread
+                .base_stitch
+                .as_ref()
+                .and_then(|id| rs.stitches.iter().find(|st| st.id == *id))
+                .map(|st| st.files.clone())
+                .unwrap_or_default();
+            let old_head = thread
+                .head_stitch
+                .as_ref()
+                .and_then(|id| rs.stitches.iter().find(|st| st.id == *id))
+                .cloned();
+            Ok((repo, PathBuf::from(&wt), scope, base_manifest, old_head))
+        })?;
+        // Phase 2 (unlocked): snapshot both trees, then walk the union.
+        let objects = store::objects_dir(&self.base(), &repo.id);
+        let wt_cap = weave::capture_scope(&wt_path, &scope, &objects)?;
+        let repo_cap =
+            weave::capture_scope(std::path::Path::new(&repo.path), &scope, &objects)?;
+        // Effective value per rel: the captured hash, or a tombstone when
+        // the base knew the file and it is gone now.
+        let eff = |m: &BTreeMap<String, String>, rel: &str| -> Option<String> {
+            m.get(rel).cloned().or_else(|| {
+                base_manifest
+                    .contains_key(rel)
+                    .then(|| TOMBSTONE.to_string())
+            })
+        };
+        let mut rels: Vec<String> = base_manifest
+            .keys()
+            .chain(wt_cap.manifest.keys())
+            .chain(repo_cap.manifest.keys())
+            .cloned()
+            .collect();
+        rels.sort();
+        rels.dedup();
+        // The next head manifest starts as "worktree now + tombstones for
+        // base files the thread deleted", then fast-forwards adjust it.
+        let mut final_head = wt_cap.manifest.clone();
+        for rel in base_manifest.keys() {
+            final_head
+                .entry(rel.clone())
+                .or_insert_with(|| TOMBSTONE.to_string());
+        }
+        let mut fast_forwarded = Vec::new();
+        let mut conflicts = Vec::new();
+        for rel in &rels {
+            let wt_h = eff(&wt_cap.manifest, rel);
+            let repo_h = eff(&repo_cap.manifest, rel);
+            let base_h = base_manifest.get(rel).cloned();
+            let thread_changed = wt_h != base_h;
+            let fabric_changed = repo_h != base_h;
+            if !thread_changed && fabric_changed {
+                match repo_cap.manifest.get(rel) {
+                    Some(h) => {
+                        // Fabric edited/added a file the thread never
+                        // touched: copy it into the worktree.
+                        let bytes = store::read_blob(&objects, h)?;
+                        let dest = weave::safe_join(&wt_path, rel)?;
+                        if let Some(dir) = dest.parent() {
+                            std::fs::create_dir_all(dir)
+                                .map_err(|e| format!("rebase mkdir {rel}: {e}"))?;
+                        }
+                        std::fs::write(&dest, bytes)
+                            .map_err(|e| format!("rebase write {rel}: {e}"))?;
+                        final_head.insert(rel.clone(), h.clone());
+                    }
+                    None => {
+                        // Fabric deleted it: mirror the deletion.
+                        if let Ok(dest) = weave::safe_join(&wt_path, rel) {
+                            let _ = std::fs::remove_file(dest);
+                        }
+                        final_head.remove(rel);
+                    }
+                }
+                fast_forwarded.push(rel.clone());
+            } else if thread_changed && fabric_changed && wt_h != repo_h {
+                conflicts.push(rel.clone());
+            }
+        }
+        // Drop tombstones for files the new base does not have either — a
+        // deletion of something already gone is not a change.
+        final_head.retain(|rel, h| h != TOMBSTONE || repo_cap.manifest.contains_key(rel));
+        // Phase 3 (locked): new base, refreshed head, honest note.
+        self.with(|s, base| {
+            let rs = s.repo_states.get_mut(&repo.id).expect("repo state exists");
+            rs.seq += 1;
+            let base_stitch = Stitch {
+                id: format!("stitch-{}-{}", now_ms(), rs.seq),
+                thread_id: thread_id.to_string(),
+                parent: None,
+                files: repo_cap.manifest.clone(),
+                ts_ms: now_ms(),
+            };
+            rs.stitches.push(base_stitch.clone());
+            let new_head = match &old_head {
+                Some(h) if h.files == final_head => None, // unchanged
+                None => None, // never stitched — nothing to re-head
+                Some(h) => {
+                    rs.seq += 1;
+                    let st = Stitch {
+                        id: format!("stitch-{}-{}", now_ms(), rs.seq),
+                        thread_id: thread_id.to_string(),
+                        parent: Some(h.id.clone()),
+                        files: final_head.clone(),
+                        ts_ms: now_ms(),
+                    };
+                    rs.stitches.push(st.clone());
+                    Some(st)
+                }
+            };
+            let thread = rs
+                .threads
+                .iter_mut()
+                .find(|t| t.id == thread_id)
+                .ok_or_else(|| format!("thread {thread_id} vanished mid-rebase"))?;
+            thread.base_stitch = Some(base_stitch.id.clone());
+            if let Some(st) = &new_head {
+                thread.head_stitch = Some(st.id.clone());
+            }
+            if thread.status == ThreadStatus::Proposed {
+                thread.status = ThreadStatus::Active;
+            }
+            thread.note = if conflicts.is_empty() {
+                "rebased onto the fabric — clean".to_string()
+            } else {
+                cap(
+                    &format!(
+                        "rebased — BOTH sides had changed {}; your version was kept in the \
+                         worktree. Review against the repo tree, then re-propose",
+                        conflicts.join(", ")
+                    ),
+                    MAX_GOAL_CHARS,
+                )
+            };
+            let approval_id = thread.approval_id.take();
+            let thread = thread.clone();
+            store::append_event(
+                base,
+                &repo.id,
+                &serde_json::json!({
+                    "ts_ms": now_ms(), "kind": "rebased", "thread": thread_id,
+                    "fast_forwarded": fast_forwarded.len(), "conflicts": conflicts,
+                }),
+            );
+            Ok(RebaseOutcome {
+                thread,
+                fast_forwarded: fast_forwarded.clone(),
+                conflicts: conflicts.clone(),
+                approval_id,
+            })
+        })
+    }
+
+    /// Remove worktrees that are DONE: a Woven thread's worktree goes once
+    /// every file it captured still matches its last stitch (nothing
+    /// uncaptured would be lost). Anything else is kept with an honest
+    /// reason — live threads are in use, orphans stay adoptable, and a
+    /// worktree with uncaptured divergence is never deleted.
+    pub fn clean_worktrees(&self, repo_id: &str) -> Result<CleanReport, String> {
+        // Phase 1 (locked): collect candidates.
+        let (repo, candidates) = self.with(|s, base| {
+            let repo = s
+                .repos
+                .iter()
+                .find(|r| r.id == repo_id)
+                .cloned()
+                .ok_or_else(|| format!("no registered repo with id {repo_id}"))?;
+            reconcile_repo(s, repo_id, now_ms(), base);
+            let rs = s.repo_states.get(repo_id).expect("repo state exists");
+            let cands: Vec<(Thread, BTreeMap<String, String>)> = rs
+                .threads
+                .iter()
+                .filter(|t| t.worktree.is_some())
+                .map(|t| {
+                    // What the worktree should contain: the head stitch,
+                    // falling back to the base for never-stitched threads.
+                    let expected = t
+                        .head_stitch
+                        .as_ref()
+                        .or(t.base_stitch.as_ref())
+                        .and_then(|id| rs.stitches.iter().find(|st| st.id == *id))
+                        .map(|st| st.files.clone())
+                        .unwrap_or_default();
+                    (t.clone(), expected)
+                })
+                .collect();
+            Ok::<_, String>((repo, cands))
+        })?;
+        // Phase 2 (unlocked): check + remove.
+        let mut report = CleanReport::default();
+        let mut cleared: Vec<String> = Vec::new();
+        for (t, expected) in candidates {
+            let wt = t.worktree.clone().expect("filtered above");
+            let wt_path = std::path::Path::new(&wt);
+            if !wt_path.is_dir() {
+                cleared.push(t.id.clone());
+                report
+                    .removed
+                    .push((t.id.clone(), format!("{wt} (already gone)")));
+                continue;
+            }
+            if t.status != ThreadStatus::Woven {
+                report.skipped.push((
+                    t.id.clone(),
+                    format!("thread is {:?} — worktree still in use", t.status),
+                ));
+                continue;
+            }
+            let mut divergent: Vec<String> = Vec::new();
+            for (rel, h) in &expected {
+                let on_disk = weave::hash_on_disk(wt_path, rel);
+                let matches = match (h.as_str(), on_disk) {
+                    (TOMBSTONE, None) => true,
+                    (want, Some(have)) => want == have,
+                    (_, None) => false,
+                };
+                if !matches {
+                    divergent.push(rel.clone());
+                }
+            }
+            if !divergent.is_empty() {
+                report.skipped.push((
+                    t.id.clone(),
+                    cap(
+                        &format!(
+                            "uncaptured changes in {} — refusing to delete; stitch or \
+                             inspect the worktree first",
+                            divergent.join(", ")
+                        ),
+                        MAX_GOAL_CHARS,
+                    ),
+                ));
+                continue;
+            }
+            match worktree::remove(std::path::Path::new(&repo.path), wt_path) {
+                Ok(()) => {
+                    cleared.push(t.id.clone());
+                    report.removed.push((t.id.clone(), wt.clone()));
+                }
+                Err(e) => report.skipped.push((t.id.clone(), e)),
+            }
+        }
+        // Phase 3 (locked): forget removed worktrees.
+        if !cleared.is_empty() {
+            self.with(|s, base| {
+                if let Some(rs) = s.repo_states.get_mut(repo_id) {
+                    for t in rs.threads.iter_mut() {
+                        if cleared.contains(&t.id) {
+                            t.worktree = None;
+                        }
+                    }
+                }
+                store::append_event(
+                    base,
+                    repo_id,
+                    &serde_json::json!({
+                        "ts_ms": now_ms(), "kind": "worktrees_cleaned",
+                        "threads": cleared,
+                    }),
+                );
+            });
+        }
+        Ok(report)
+    }
+
     /// Auto-recover Proposed threads whose parked approval no longer exists.
     /// In hosts whose approvals are in-memory only, a restart drops every
     /// one, and a timeout can resolve them Deny without this engine hearing
@@ -1131,6 +1928,179 @@ impl Loom {
                 }
             }
         });
+    }
+
+    // -- sync support (called by the `sync` module; engine stays git-free) --
+
+    /// Apply weaves another machine landed on the shared fabric: overlay
+    /// each weave's `applied` manifest onto the repo tree (blobs must
+    /// already be in the local object store), record the weave, advance the
+    /// tip. The caller (sync) verified these ids extend our history —
+    /// weaves already present are skipped.
+    pub fn import_fabric_weaves(
+        &self,
+        repo_id: &str,
+        weaves: Vec<Weave>,
+        origin: &str,
+    ) -> Result<usize, String> {
+        self.with(|s, base| {
+            let repo = s
+                .repos
+                .iter()
+                .find(|r| r.id == repo_id)
+                .cloned()
+                .ok_or_else(|| format!("no registered repo with id {repo_id}"))?;
+            let rs = s.repo_states.get_mut(repo_id).expect("repo state exists");
+            let objects = store::objects_dir(base, repo_id);
+            let mut applied_count = 0;
+            for w in weaves {
+                if rs.fabric.history.iter().any(|id| *id == w.id) {
+                    continue;
+                }
+                weave::apply_overlay(std::path::Path::new(&repo.path), &w.applied, &objects)?;
+                rs.fabric.tip = Some(w.id.clone());
+                rs.fabric.history.push(w.id.clone());
+                store::append_event(
+                    base,
+                    repo_id,
+                    &serde_json::json!({
+                        "ts_ms": now_ms(), "kind": "weave_synced_in", "weave": w.id,
+                        "from": origin, "files": w.applied.len(),
+                    }),
+                );
+                rs.weaves.push(w);
+                applied_count += 1;
+            }
+            Ok(applied_count)
+        })
+    }
+
+    /// Replace the cached peer view (what other machines last published)
+    /// and record cross-machine toe-steps: our live leases vs each peer's,
+    /// one warning per lease pair, deduplicated against what is already
+    /// recorded.
+    pub fn update_peers(
+        &self,
+        repo_id: &str,
+        peers: Vec<PeerSnapshot>,
+    ) -> Result<Vec<ToeStep>, String> {
+        let now = now_ms();
+        self.with(|s, base| {
+            if !s.repos.iter().any(|r| r.id == repo_id) {
+                return Err(format!("no registered repo with id {repo_id}"));
+            }
+            reconcile_repo(s, repo_id, now, base);
+            let rs = s.repo_states.get_mut(repo_id).expect("repo state exists");
+            let mut fresh = Vec::new();
+            for peer in &peers {
+                for pl in &peer.leases {
+                    // Only the peer's live leases can be stepped on.
+                    let live = !pl.expired(now)
+                        && peer.threads.iter().any(|t| {
+                            t.lease_id.as_deref() == Some(&pl.id) && t.status.is_live()
+                        });
+                    if !live {
+                        continue;
+                    }
+                    for ours in rs.leases.clone() {
+                        let ours_live = !ours.expired(now)
+                            && rs.threads.iter().any(|t| {
+                                t.lease_id.as_deref() == Some(&ours.id) && t.status.is_live()
+                            });
+                        if !ours_live {
+                            continue;
+                        }
+                        let already = rs
+                            .toe_steps
+                            .iter()
+                            .any(|t| t.lease_a == ours.id && t.lease_b == pl.id);
+                        if already {
+                            continue;
+                        }
+                        let hit = ours.scope.iter().find_map(|a| {
+                            pl.scope
+                                .iter()
+                                .find(|b| lease::patterns_may_overlap(a, b))
+                                .map(|b| (a.clone(), b.clone()))
+                        });
+                        if let Some((pat_a, pat_b)) = hit {
+                            let step = ToeStep {
+                                id: format!("toe-{now}-{}", rs.toe_steps.len() + fresh.len() + 1),
+                                ts_ms: now,
+                                lease_a: ours.id.clone(),
+                                lease_b: pl.id.clone(),
+                                goal_a: ours.goal.clone(),
+                                goal_b: format!("{} [on {}]", pl.goal, peer.machine),
+                                pattern_a: pat_a.clone(),
+                                pattern_b: pat_b.clone(),
+                                suggested_split: lease::suggest_split(&pat_a, &pat_b),
+                            };
+                            rs.toe_steps.push(step.clone());
+                            fresh.push(step.clone());
+                            store::append_event(
+                                base,
+                                repo_id,
+                                &serde_json::json!({
+                                    "ts_ms": now, "kind": "toe_step_cross_machine",
+                                    "lease_a": step.lease_a, "lease_b": step.lease_b,
+                                    "peer": peer.machine,
+                                }),
+                            );
+                        }
+                    }
+                }
+            }
+            rs.peers = peers;
+            Ok(fresh)
+        })
+    }
+
+    /// Import a thread claimed from another machine (the sync module won its
+    /// claim CAS first): thread + lease + stitches enter local state, the
+    /// thread lands as Orphaned so the normal [`Loom::adopt`] flow — fresh
+    /// worktree, head stitch materialized — takes it from there. Blobs for
+    /// the stitch manifests must already be in the local object store.
+    pub fn import_thread(
+        &self,
+        repo_id: &str,
+        mut thread: Thread,
+        lease: Lease,
+        stitches: Vec<Stitch>,
+        origin: &str,
+    ) -> Result<Thread, String> {
+        self.with(|s, base| {
+            if !s.repos.iter().any(|r| r.id == repo_id) {
+                return Err(format!("no registered repo with id {repo_id}"));
+            }
+            let rs = s.repo_states.get_mut(repo_id).expect("repo state exists");
+            if rs.threads.iter().any(|t| t.id == thread.id) {
+                return Err(format!("thread {} already exists locally", thread.id));
+            }
+            thread.repo_id = repo_id.to_string();
+            thread.status = ThreadStatus::Orphaned;
+            thread.worktree = None; // the dead machine's path means nothing here
+            thread.base_stitch = None; // rebased against OUR tree on adopt
+            thread.approval_id = None;
+            thread.lease_id = Some(lease.id.clone());
+            thread.note = format!("orphan imported from {origin}");
+            for st in stitches {
+                if !rs.stitches.iter().any(|x| x.id == st.id) {
+                    rs.stitches.push(st);
+                }
+            }
+            rs.leases.retain(|l| l.id != lease.id);
+            rs.leases.push(lease);
+            rs.threads.push(thread.clone());
+            store::append_event(
+                base,
+                repo_id,
+                &serde_json::json!({
+                    "ts_ms": now_ms(), "kind": "thread_imported",
+                    "thread": thread.id, "from": origin,
+                }),
+            );
+            Ok(thread)
+        })
     }
 
     // -- reads --------------------------------------------------------------
@@ -1275,21 +2245,22 @@ fn prune(s: &mut LoomState) {
         }
         let thread_ids: Vec<String> = rs.threads.iter().map(|t| t.id.clone()).collect();
         for tid in thread_ids {
-            let head = rs
+            let (head, base) = rs
                 .threads
                 .iter()
                 .find(|t| t.id == tid)
-                .and_then(|t| t.head_stitch.clone());
+                .map(|t| (t.head_stitch.clone(), t.base_stitch.clone()))
+                .unwrap_or((None, None));
             loop {
                 let count = rs.stitches.iter().filter(|st| st.thread_id == tid).count();
                 if count <= MAX_STITCHES_PER_THREAD {
                     break;
                 }
-                let Some(pos) = rs
-                    .stitches
-                    .iter()
-                    .position(|st| st.thread_id == tid && Some(&st.id) != head.as_ref())
-                else {
+                let Some(pos) = rs.stitches.iter().position(|st| {
+                    st.thread_id == tid
+                        && Some(&st.id) != head.as_ref()
+                        && Some(&st.id) != base.as_ref()
+                }) else {
                     break;
                 };
                 rs.stitches.remove(pos);
@@ -1616,6 +2587,339 @@ mod tests {
         loom.reconcile_parked(&std::collections::HashSet::new());
         let t = loom.snapshot().repo_states[&repo.id].threads[0].clone();
         assert_eq!(t.status, ThreadStatus::Proposed, "no approval id → left alone");
+    }
+
+    // -- worktree isolation --------------------------------------------------
+
+    fn git_ok(dir: &PathBuf, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .expect("run git");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// A rig whose repo is a real git repo with one commit — isolation
+    /// activates under Auto.
+    fn git_rig(tag: &str) -> (Loom, PathBuf, RepoConfig) {
+        let base = scratch(&format!("{tag}-data"));
+        let repo_dir = scratch(&format!("{tag}-repo"));
+        mk_repo(
+            &repo_dir,
+            &[
+                ("src/main.rs", "fn main() {}\n"),
+                ("src/util.rs", "pub fn u() {}\n"),
+            ],
+        );
+        git_ok(&repo_dir, &["init", "-q"]);
+        git_ok(&repo_dir, &["config", "user.email", "loom@test"]);
+        git_ok(&repo_dir, &["config", "user.name", "loom test"]);
+        git_ok(&repo_dir, &["add", "-A"]);
+        git_ok(&repo_dir, &["commit", "-q", "-m", "base"]);
+        let loom = Loom::at(base);
+        let repo = loom
+            .register_repo(repo_dir.to_str().unwrap(), Some("true".into()), false)
+            .expect("register");
+        (loom, repo_dir, repo)
+    }
+
+    fn read(p: &std::path::Path) -> String {
+        std::fs::read_to_string(p).unwrap_or_default()
+    }
+
+    #[test]
+    fn isolated_lease_gets_a_worktree_and_edits_there_never_touch_the_repo() {
+        let (loom, repo_dir, repo) = git_rig("iso");
+        let d = loom
+            .declare_lease(&repo.id, "t", "solo work", vec!["src/**".into()], vec![], None)
+            .expect("lease");
+        let wt = d.thread.worktree.clone().expect("isolated by default on a git repo");
+        assert_eq!(d.working_dir, wt);
+        assert!(d.thread.base_stitch.is_some(), "base snapshotted");
+        let wt = PathBuf::from(&wt);
+        assert!(wt.join("src/main.rs").exists(), "worktree has HEAD's files");
+        // No edits yet: stitch reports unchanged vs the base, head stays None.
+        let s0 = loom.stitch(&d.lease.id).expect("stitch 0");
+        assert!(s0.unchanged);
+        // Edit IN THE WORKTREE.
+        std::fs::write(wt.join("src/main.rs"), "fn main() { /* wt */ }\n").unwrap();
+        let s1 = loom.stitch(&d.lease.id).expect("stitch 1");
+        assert!(!s1.unchanged);
+        // The repo tree is untouched by leasing, editing, stitching.
+        assert_eq!(read(&repo_dir.join("src/main.rs")), "fn main() {}\n");
+        // Green weave + land applies ONLY the thread's delta to the repo.
+        let out = loom.propose(&d.thread.id).expect("propose");
+        assert!(out.green);
+        let landed = loom.land_weave(&out.weave.id).expect("land");
+        assert_eq!(landed.files_applied, 1, "only the changed file lands");
+        assert_eq!(read(&repo_dir.join("src/main.rs")), "fn main() { /* wt */ }\n");
+    }
+
+    #[test]
+    fn two_threads_overlap_first_lands_second_refused_then_rebase_then_lands() {
+        let (loom, repo_dir, repo) = git_rig("pair");
+        let da = loom
+            .declare_lease(&repo.id, "alice", "restyle main", vec!["src/**".into()], vec![], None)
+            .expect("lease a");
+        let db = loom
+            .declare_lease(&repo.id, "bob", "rework main too", vec!["src/**".into()], vec![], None)
+            .expect("lease b");
+        assert!(!db.toe_steps.is_empty(), "overlap warned at declaration");
+        let wa = PathBuf::from(da.thread.worktree.as_ref().unwrap());
+        let wb = PathBuf::from(db.thread.worktree.as_ref().unwrap());
+        assert_ne!(wa, wb, "each thread has its OWN tree");
+        // Overlapping edits to the same file, in separate worktrees; Alice
+        // also touches util.rs (Bob never does).
+        std::fs::write(wa.join("src/main.rs"), "fn main() { /* alice */ }\n").unwrap();
+        std::fs::write(wa.join("src/util.rs"), "pub fn u() { /* alice */ }\n").unwrap();
+        std::fs::write(wb.join("src/main.rs"), "fn main() { /* bob */ }\n").unwrap();
+        loom.stitch(&da.lease.id).expect("stitch a");
+        loom.stitch(&db.lease.id).expect("stitch b");
+        // No clobbering happened: both worktrees hold their own versions.
+        assert!(read(&wa.join("src/main.rs")).contains("alice"));
+        assert!(read(&wb.join("src/main.rs")).contains("bob"));
+        // Alice lands first.
+        let pa = loom.propose(&da.thread.id).expect("propose a");
+        loom.land_weave(&pa.weave.id).expect("land a");
+        assert!(read(&repo_dir.join("src/main.rs")).contains("alice"));
+        // Bob's verify is green — but landing refuses honestly: the fabric
+        // moved under him on the shared file.
+        let pb = loom.propose(&db.thread.id).expect("propose b");
+        assert!(pb.green);
+        let err = loom.land_weave(&pb.weave.id).unwrap_err();
+        assert!(err.contains("fabric moved under you"), "{err}");
+        assert!(err.contains("src/main.rs"), "{err}");
+        assert!(err.contains("rebase"), "{err}");
+        // Alice's version is still intact — nothing was clobbered.
+        assert!(read(&repo_dir.join("src/main.rs")).contains("alice"));
+        // Rebase: util.rs (fabric-only) fast-forwards, main.rs conflicts
+        // and keeps Bob's version.
+        let rb = loom.rebase_thread(&db.thread.id).expect("rebase b");
+        assert_eq!(rb.conflicts, vec!["src/main.rs".to_string()]);
+        assert!(rb.fast_forwarded.contains(&"src/util.rs".to_string()));
+        assert!(read(&wb.join("src/util.rs")).contains("alice"), "fabric ff'd in");
+        assert!(read(&wb.join("src/main.rs")).contains("bob"), "thread's kept");
+        assert_eq!(rb.thread.status, ThreadStatus::Active);
+        // Bob reconciles by hand, re-stitches, re-proposes — and lands.
+        std::fs::write(wb.join("src/main.rs"), "fn main() { /* alice+bob */ }\n").unwrap();
+        loom.stitch(&db.lease.id).expect("stitch b2");
+        let pb2 = loom.propose(&db.thread.id).expect("propose b2");
+        assert!(pb2.green);
+        loom.land_weave(&pb2.weave.id).expect("land b2");
+        assert!(read(&repo_dir.join("src/main.rs")).contains("alice+bob"));
+        // util.rs kept Alice's version — Bob's stale base never overwrote it.
+        assert!(read(&repo_dir.join("src/util.rs")).contains("alice"));
+    }
+
+    #[test]
+    fn isolation_modes_in_place_flag_plain_dirs_and_isolated_refusal() {
+        // A git repo with --in-place behaves like v0.1: no worktree.
+        let (loom, _repo_dir, repo) = git_rig("modes");
+        let d = loom
+            .declare_lease_mode(
+                &repo.id, "t", "old style", vec!["src/**".into()], vec![], None,
+                IsolationMode::InPlace,
+            )
+            .expect("in-place lease");
+        assert!(d.thread.worktree.is_none());
+        assert!(d.thread.base_stitch.is_none());
+        assert_eq!(d.working_dir, repo.path);
+        // A plain directory under Auto works in place too.
+        let (loom2, _dir2, repo2) = rig("modes-plain");
+        let d2 = loom2
+            .declare_lease(&repo2.id, "t", "plain", vec!["src/**".into()], vec![], None)
+            .expect("plain lease");
+        assert!(d2.thread.worktree.is_none());
+        // Demanding isolation on a plain directory fails AND rolls back.
+        let err = loom2
+            .declare_lease_mode(
+                &repo2.id, "t", "must isolate", vec!["src/**".into()], vec![], None,
+                IsolationMode::Isolated,
+            )
+            .unwrap_err();
+        assert!(err.contains("worktree setup failed"), "{err}");
+        let snap = loom2.snapshot();
+        assert_eq!(
+            snap.repo_states[&repo2.id].threads.len(),
+            1,
+            "the refused lease left nothing behind"
+        );
+    }
+
+    #[test]
+    fn deletions_are_tombstoned_applied_on_land_and_conflict_on_fabric_edit() {
+        let (loom, repo_dir, repo) = git_rig("del");
+        // Thread 1 deletes util.rs in its worktree.
+        let d = loom
+            .declare_lease(&repo.id, "t", "drop util", vec!["src/**".into()], vec![], None)
+            .expect("lease");
+        let wt = PathBuf::from(d.thread.worktree.as_ref().unwrap());
+        std::fs::remove_file(wt.join("src/util.rs")).unwrap();
+        let s = loom.stitch(&d.lease.id).expect("stitch");
+        assert_eq!(
+            s.stitch.files.get("src/util.rs").map(String::as_str),
+            Some(TOMBSTONE),
+            "deletion recorded as a tombstone"
+        );
+        let p = loom.propose(&d.thread.id).expect("propose");
+        assert!(p.green);
+        loom.land_weave(&p.weave.id).expect("land");
+        assert!(!repo_dir.join("src/util.rs").exists(), "weave applied the deletion");
+        // Thread 2 deletes main.rs — but the fabric edits it meanwhile:
+        // delete-vs-edit is a conflict, refused honestly.
+        let d2 = loom
+            .declare_lease(&repo.id, "t", "drop main", vec!["src/**".into()], vec![], None)
+            .expect("lease 2");
+        let wt2 = PathBuf::from(d2.thread.worktree.as_ref().unwrap());
+        std::fs::remove_file(wt2.join("src/main.rs")).unwrap();
+        loom.stitch(&d2.lease.id).expect("stitch 2");
+        std::fs::write(repo_dir.join("src/main.rs"), "fn main() { /* moved */ }\n").unwrap();
+        let p2 = loom.propose(&d2.thread.id).expect("propose 2");
+        assert!(p2.green);
+        let err = loom.land_weave(&p2.weave.id).unwrap_err();
+        assert!(err.contains("fabric moved under you"), "{err}");
+        assert!(repo_dir.join("src/main.rs").exists(), "nothing was deleted");
+        // In-place threads track deletions vs their previous stitch too.
+        let (loom3, dir3, repo3) = rig("del-inplace");
+        let d3 = loom3
+            .declare_lease(&repo3.id, "t", "prune", vec!["src/**".into()], vec![], None)
+            .expect("lease 3");
+        loom3.stitch(&d3.lease.id).expect("stitch 3a");
+        std::fs::remove_file(dir3.join("src/main.rs")).unwrap();
+        let s3 = loom3.stitch(&d3.lease.id).expect("stitch 3b");
+        assert_eq!(
+            s3.stitch.files.get("src/main.rs").map(String::as_str),
+            Some(TOMBSTONE)
+        );
+    }
+
+    #[test]
+    fn adopt_hands_over_the_worktree_or_materializes_one() {
+        let (loom, _repo_dir, repo) = git_rig("adopt-wt");
+        let d = loom
+            .declare_lease(
+                &repo.id, "first", "half-done work", vec!["src/**".into()], vec![],
+                Some(MIN_TTL_MS),
+            )
+            .expect("lease");
+        let wt = d.thread.worktree.clone().expect("isolated");
+        std::fs::write(
+            PathBuf::from(&wt).join("src/main.rs"),
+            "fn main() { /* half */ }\n",
+        )
+        .unwrap();
+        loom.stitch(&d.lease.id).expect("stitch");
+        // The holder dies (heartbeat ages out); the thread orphans.
+        loom.with(|s, _| {
+            s.repo_states.get_mut(&repo.id).unwrap().leases[0].last_heartbeat_ms = 1;
+        });
+        loom.reconcile();
+        // Adoption hands over the SAME worktree, work intact.
+        let (thread, _lease) = loom.adopt(&d.thread.id, "second").expect("adopt");
+        assert_eq!(thread.worktree.as_deref(), Some(wt.as_str()));
+        assert!(read(&PathBuf::from(&wt).join("src/main.rs")).contains("half"));
+        // An orphan WITHOUT a worktree (imported from another machine)
+        // gets one materialized at its head stitch.
+        let imported = Thread {
+            id: "thread-import-1".into(),
+            repo_id: repo.id.clone(),
+            goal: "imported work".into(),
+            head_stitch: Some(
+                loom.snapshot().repo_states[&repo.id]
+                    .stitches
+                    .iter()
+                    .rev()
+                    .find(|st| st.thread_id == d.thread.id && st.files.values().any(|h| h != TOMBSTONE))
+                    .unwrap()
+                    .id
+                    .clone(),
+            ),
+            lease_id: None,
+            status: ThreadStatus::Orphaned,
+            note: String::new(),
+            approval_id: None,
+            worktree: None,
+            base_stitch: None,
+        };
+        // Re-point the head stitch at the imported thread id and give it a
+        // lease record, the way sync's import_thread does.
+        let lease = Lease {
+            id: "lease-import-1".into(),
+            thread_id: imported.id.clone(),
+            scope: vec!["src/**".into()],
+            goal: imported.goal.clone(),
+            criteria: vec![],
+            holder: "dead machine".into(),
+            ttl_ms: MIN_TTL_MS,
+            last_heartbeat_ms: 1,
+        };
+        let head_id = imported.head_stitch.clone().unwrap();
+        loom.with(|s, _| {
+            let rs = s.repo_states.get_mut(&repo.id).unwrap();
+            let mut st = rs.stitches.iter().find(|st| st.id == head_id).unwrap().clone();
+            st.id = "stitch-import-1".into();
+            st.thread_id = imported.id.clone();
+            st.parent = None;
+            rs.stitches.push(st);
+        });
+        let mut imported = imported;
+        imported.head_stitch = Some("stitch-import-1".into());
+        loom.import_thread(&repo.id, imported, lease, vec![], "m-elsewhere")
+            .expect("import");
+        let (t2, _l2) = loom.adopt("thread-import-1", "adopter").expect("adopt imported");
+        let wt2 = t2.worktree.expect("worktree materialized");
+        assert!(read(&PathBuf::from(&wt2).join("src/main.rs")).contains("half"));
+        assert!(t2.base_stitch.is_some(), "based against OUR tree");
+    }
+
+    #[test]
+    fn clean_removes_only_captured_woven_worktrees() {
+        let (loom, _repo_dir, repo) = git_rig("clean");
+        let d = loom
+            .declare_lease(&repo.id, "t", "finish and clean", vec!["src/**".into()], vec![], None)
+            .expect("lease");
+        let wt = PathBuf::from(d.thread.worktree.as_ref().unwrap());
+        std::fs::write(wt.join("src/main.rs"), "fn main() { /* done */ }\n").unwrap();
+        loom.stitch(&d.lease.id).expect("stitch");
+        let p = loom.propose(&d.thread.id).expect("propose");
+        loom.land_weave(&p.weave.id).expect("land");
+        // A live thread's worktree is never cleaned.
+        let d2 = loom
+            .declare_lease(&repo.id, "t", "still working", vec!["src/**".into()], vec![], None)
+            .expect("lease 2");
+        // Divergence after weaving: refuse (uncaptured bytes would be lost).
+        std::fs::write(wt.join("src/main.rs"), "fn main() { /* uncaptured */ }\n").unwrap();
+        let report = loom.clean_worktrees(&repo.id).expect("clean 1");
+        assert!(report.removed.is_empty());
+        assert!(report
+            .skipped
+            .iter()
+            .any(|(tid, why)| tid == &d.thread.id && why.contains("uncaptured")));
+        assert!(report
+            .skipped
+            .iter()
+            .any(|(tid, why)| tid == &d2.thread.id && why.contains("in use")));
+        // Restore the captured content: now the woven worktree goes.
+        std::fs::write(wt.join("src/main.rs"), "fn main() { /* done */ }\n").unwrap();
+        let report = loom.clean_worktrees(&repo.id).expect("clean 2");
+        assert!(report.removed.iter().any(|(tid, _)| tid == &d.thread.id));
+        assert!(!wt.exists());
+        let snap = loom.snapshot();
+        let t = snap.repo_states[&repo.id]
+            .threads
+            .iter()
+            .find(|t| t.id == d.thread.id)
+            .unwrap()
+            .clone();
+        assert!(t.worktree.is_none(), "forgotten after removal");
+        // The live thread's worktree survived.
+        assert!(PathBuf::from(d2.thread.worktree.as_ref().unwrap()).exists());
     }
 
     #[test]

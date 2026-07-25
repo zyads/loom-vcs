@@ -17,7 +17,7 @@
 use std::process::ExitCode;
 
 use loom::consent::{TerminalConsent, WeaveDisposition};
-use loom::{solo, store, Loom, RepoConfig, ThreadStatus};
+use loom::{solo, store, sync, IsolationMode, Loom, RepoConfig, ThreadStatus};
 
 mod mcp;
 
@@ -26,18 +26,28 @@ loom — version control for many hands moving at once (docs/DESIGN.md)
 
 usage:
   loom init [--verify CMD] [--git-bridge]     register the current directory
-  loom lease \"<goal>\" <scope...>              declare an intent lease
-       [--criteria TEXT]... [--ttl-ms N]      (scopes are repo-relative globs)
-  loom stitch                                 checkpoint the leased scope
-  loom propose                                verify in a scratch copy; green
+  loom lease \"<goal>\" <scope...>              declare an intent lease; on a git
+       [--criteria TEXT]... [--ttl-ms N]      repo the thread gets its OWN
+       [--isolated | --in-place]              worktree — edit there
+  loom stitch [--lease ID]                    checkpoint the leased scope
+  loom propose [--thread ID]                  verify in a scratch copy; green
                                               asks you before applying
+  loom rebase [--thread ID]                   refresh the thread's worktree from
+                                              the fabric (after \"fabric moved\")
   loom withdraw                               return a proposed thread to active
   loom adopt <thread-id>                      take over an orphaned thread
-  loom status                                 threads, leases, orphans, fabric
+                                              (local, or a synced peer's)
+  loom clean                                  remove worktrees of woven threads
+                                              (refuses uncaptured divergence)
+  loom sync [--remote NAME] [--auto on|off]   sync leases/threads/fabric with a
+                                              git remote (shares scoped content
+                                              there — same exposure as a push)
+  loom status                                 threads, leases, orphans, peers
   loom log                                    fabric history + recent events
   loom mcp                                    stdio MCP server (loom_status,
                                               loom_lease, loom_stitch,
-                                              loom_propose, loom_adopt)
+                                              loom_propose, loom_rebase,
+                                              loom_adopt)
 
 state: ~/.loom (override with LOOM_DATA)";
 
@@ -48,10 +58,13 @@ fn main() -> ExitCode {
     let out = match verb {
         "init" => cmd_init(rest),
         "lease" => cmd_lease(rest),
-        "stitch" => cmd_stitch(),
-        "propose" => cmd_propose(),
+        "stitch" => cmd_stitch(rest),
+        "propose" => cmd_propose(rest),
+        "rebase" => cmd_rebase(rest),
         "withdraw" => cmd_withdraw(),
         "adopt" => cmd_adopt(rest),
+        "clean" => cmd_clean(),
+        "sync" => cmd_sync(rest),
         "status" => cmd_status(),
         "log" => cmd_log(),
         "mcp" => {
@@ -99,6 +112,57 @@ fn current_pointer(engine: &Loom) -> Result<(RepoConfig, solo::SoloPointer), Str
     Ok((repo, ptr))
 }
 
+/// An explicit `--lease <id>` / `--thread <id>` flag value, when given.
+/// Several terminals (or agents) sharing one data dir use these to address
+/// their own thread instead of the shared solo pointer.
+fn flag_value(rest: &[String], flag: &str) -> Result<Option<String>, String> {
+    let mut it = rest.iter();
+    while let Some(a) = it.next() {
+        if a == flag {
+            return match it.next() {
+                Some(v) => Ok(Some(v.clone())),
+                None => Err(format!("{flag} needs a value")),
+            };
+        }
+    }
+    Ok(None)
+}
+
+/// Resolve which lease+thread a verb addresses: explicit flags win, the
+/// solo pointer covers the everyday single-seat case.
+fn target(
+    engine: &Loom,
+    rest: &[String],
+) -> Result<(RepoConfig, String /*lease*/, String /*thread*/), String> {
+    let lease_flag = flag_value(rest, "--lease")?;
+    let thread_flag = flag_value(rest, "--thread")?;
+    let repo = current_repo(engine)?;
+    if lease_flag.is_some() || thread_flag.is_some() {
+        let snap = engine.snapshot();
+        let rs = snap
+            .repo_states
+            .get(&repo.id)
+            .cloned()
+            .unwrap_or_default();
+        let thread = rs
+            .threads
+            .iter()
+            .find(|t| {
+                Some(&t.id) == thread_flag.as_ref()
+                    || (thread_flag.is_none() && t.lease_id == lease_flag)
+            })
+            .cloned()
+            .ok_or_else(|| "no thread matches the given --lease/--thread id".to_string())?;
+        let lease = thread
+            .lease_id
+            .clone()
+            .ok_or_else(|| format!("thread {} has no lease", thread.id))?;
+        return Ok((repo, lease, thread.id));
+    }
+    let (repo, ptr) = current_pointer(engine)?;
+    Ok((repo, ptr.lease_id, ptr.thread_id))
+}
+
 fn cmd_init(rest: &[String]) -> Result<(), String> {
     let mut verify = None;
     let mut git_bridge = false;
@@ -137,6 +201,7 @@ fn cmd_lease(rest: &[String]) -> Result<(), String> {
     let mut scope = Vec::new();
     let mut criteria = Vec::new();
     let mut ttl_ms = None;
+    let mut mode = IsolationMode::Auto;
     let mut it = rest.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -149,22 +214,38 @@ fn cmd_lease(rest: &[String]) -> Result<(), String> {
                 let v = it.next().ok_or_else(|| "--ttl-ms needs a number".to_string())?;
                 ttl_ms = Some(v.parse::<u64>().map_err(|_| format!("bad --ttl-ms '{v}'"))?);
             }
+            "--isolated" => mode = IsolationMode::Isolated,
+            "--in-place" => mode = IsolationMode::InPlace,
             other if goal.is_none() => goal = Some(other.to_string()),
             other => scope.push(other.to_string()),
         }
     }
     let goal = goal.ok_or_else(|| {
-        "usage: loom lease \"<goal>\" <scope...> [--criteria TEXT]... [--ttl-ms N]".to_string()
+        "usage: loom lease \"<goal>\" <scope...> [--criteria TEXT]... [--ttl-ms N] \
+         [--isolated|--in-place]"
+            .to_string()
     })?;
     let engine = store();
     let repo = current_repo(engine)?;
-    let out = engine.declare_lease(&repo.id, &holder(), &goal, scope, criteria, ttl_ms)?;
+    let out = engine.declare_lease_mode(&repo.id, &holder(), &goal, scope, criteria, ttl_ms, mode)?;
     solo::set(&engine.base(), &repo.id, &out.lease.id, &out.thread.id);
     println!("lease {} (thread {})", out.lease.id, out.thread.id);
     println!("  goal:   {}", out.lease.goal);
     println!("  scope:  {}", out.lease.scope.join(", "));
     if !out.lease.criteria.is_empty() {
         println!("  criteria: {}", out.lease.criteria.join("; "));
+    }
+    if out.thread.worktree.is_some() {
+        println!();
+        println!("  WORK IN: {}", out.working_dir);
+        println!("           (your isolated worktree — edit files THERE; the repo tree");
+        println!("            changes only when your weave lands, and never over anyone)");
+        println!();
+    } else {
+        println!("  working in place: {}", out.working_dir);
+        if !out.thread.note.is_empty() {
+            println!("  note: {}", out.thread.note);
+        }
     }
     println!(
         "  expires in {}s without a heartbeat (stitching heartbeats for you)",
@@ -177,23 +258,165 @@ fn cmd_lease(rest: &[String]) -> Result<(), String> {
         }
         println!("    (a lease warns, it never blocks — coordinate or continue)");
     }
+    autosync(engine, &repo);
     Ok(())
 }
 
-fn cmd_stitch() -> Result<(), String> {
+/// Fire an auto-sync pass when the repo opted in; print, never fail the
+/// local operation.
+fn autosync(engine: &Loom, repo: &RepoConfig) {
+    // Re-read the repo config: sync flags may have just changed.
+    let repo = engine
+        .snapshot()
+        .repos
+        .into_iter()
+        .find(|r| r.id == repo.id)
+        .unwrap_or_else(|| repo.clone());
+    match sync::maybe_autosync(engine, &repo) {
+        None => {}
+        Some(Ok(out)) => print_sync(&out, true),
+        Some(Err(e)) => println!("  auto-sync failed (local work unaffected): {e}"),
+    }
+}
+
+fn print_sync(out: &sync::SyncOutcome, brief: bool) {
+    if !brief {
+        println!("synced with '{}' as {}", out.remote, out.machine);
+    } else {
+        println!("  auto-synced with '{}'", out.remote);
+    }
+    if out.fabric_pulled > 0 {
+        println!(
+            "  pulled {} weave(s) from the shared fabric into this tree",
+            out.fabric_pulled
+        );
+    }
+    if out.fabric_pushed > 0 {
+        println!("  published {} local weave(s) to the shared fabric", out.fabric_pushed);
+    }
+    if let Some(note) = &out.cas_refused {
+        println!("  FABRIC MOVED: {note}");
+    }
+    if !out.peers.is_empty() {
+        println!("  peers: {}", out.peers.join(", "));
+    }
+    for t in &out.toe_steps {
+        println!(
+            "  CROSS-MACHINE TOE-STEP: your '{}' overlaps '{}' ({} vs {})",
+            t.goal_a, t.goal_b, t.pattern_a, t.pattern_b
+        );
+    }
+    for (tid, goal, machine) in &out.remote_orphans {
+        println!("  adoptable on {machine}: {tid} — {goal} (loom adopt {tid})");
+    }
+}
+
+fn cmd_sync(rest: &[String]) -> Result<(), String> {
+    let mut remote = None;
+    let mut auto = None;
+    let mut it = rest.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--remote" => {
+                remote = Some(
+                    it.next()
+                        .ok_or_else(|| "--remote needs a git remote name".to_string())?
+                        .clone(),
+                )
+            }
+            "--auto" => {
+                let v = it.next().map(String::as_str).unwrap_or("on");
+                auto = Some(match v {
+                    "on" | "true" => true,
+                    "off" | "false" => false,
+                    other => return Err(format!("--auto takes on|off, got '{other}'")),
+                });
+            }
+            other => return Err(format!("unknown sync flag '{other}'")),
+        }
+    }
     let engine = store();
-    let (_repo, ptr) = current_pointer(engine)?;
+    let repo = current_repo(engine)?;
+    if remote.is_some() || auto.is_some() {
+        println!(
+            "note: sync shares this repo's loom metadata AND scoped file content with the \
+             remote — the same exposure as pushing a branch there."
+        );
+    }
+    let out = sync::sync(engine, &repo.id, remote.as_deref(), auto)?;
+    print_sync(&out, false);
+    if out.fabric_pulled == 0
+        && out.fabric_pushed == 0
+        && out.cas_refused.is_none()
+        && out.peers.is_empty()
+    {
+        println!("  nothing new either way");
+    }
+    Ok(())
+}
+
+fn cmd_rebase(rest: &[String]) -> Result<(), String> {
+    let engine = store();
+    let (_repo, _lease_id, thread_id) = target(engine, rest)?;
+    let out = engine.rebase_thread(&thread_id)?;
+    if out.fast_forwarded.is_empty() && out.conflicts.is_empty() {
+        println!("already in step with the fabric — nothing to do");
+    }
+    for f in &out.fast_forwarded {
+        println!("  fast-forwarded from fabric: {f}");
+    }
+    if !out.conflicts.is_empty() {
+        println!("  CONFLICTS — both the fabric and this thread changed:");
+        for f in &out.conflicts {
+            println!("    {f} (your version kept in the worktree; the fabric's is in the repo tree)");
+        }
+        println!("  review those files, then `loom stitch` and `loom propose`.");
+    } else {
+        println!("rebased clean — `loom propose` when ready");
+    }
+    Ok(())
+}
+
+fn cmd_clean() -> Result<(), String> {
+    let engine = store();
+    let repo = current_repo(engine)?;
+    let report = engine.clean_worktrees(&repo.id)?;
+    for (tid, path) in &report.removed {
+        println!("removed {path} ({tid})");
+    }
+    for (tid, reason) in &report.skipped {
+        println!("kept {tid}: {reason}");
+    }
+    if report.removed.is_empty() && report.skipped.is_empty() {
+        println!("no worktrees to clean");
+    }
+    Ok(())
+}
+
+fn cmd_stitch(rest: &[String]) -> Result<(), String> {
+    let engine = store();
+    let (repo, lease_id, _thread_id) = target(engine, rest)?;
     // A human running `stitch` is alive: heartbeat first so active work
     // never orphans mid-session. (Refused for orphans — adopt instead.)
-    engine.heartbeat(&ptr.lease_id)?;
-    let out = engine.stitch(&ptr.lease_id)?;
+    engine.heartbeat(&lease_id)?;
+    let out = engine.stitch(&lease_id)?;
     if out.unchanged {
         println!(
             "unchanged — head stitch {} already matches the scope",
             out.stitch.id
         );
     } else {
-        println!("stitch {} ({} files)", out.stitch.id, out.stitch.files.len());
+        let dels = out.stitch.files.values().filter(|h| *h == loom::TOMBSTONE).count();
+        if dels > 0 {
+            println!(
+                "stitch {} ({} files, {} deletion(s))",
+                out.stitch.id,
+                out.stitch.files.len() - dels,
+                dels
+            );
+        } else {
+            println!("stitch {} ({} files)", out.stitch.id, out.stitch.files.len());
+        }
     }
     for s in &out.skipped {
         println!("  skipped: {s}");
@@ -202,6 +425,7 @@ fn cmd_stitch() -> Result<(), String> {
         "  lease expires in {}s",
         out.lease.expires_in_ms(wall_ms()) / 1000
     );
+    autosync(engine, &repo);
     Ok(())
 }
 
@@ -213,11 +437,11 @@ fn wall_ms() -> u64 {
         .unwrap_or(0)
 }
 
-fn cmd_propose() -> Result<(), String> {
+fn cmd_propose(rest: &[String]) -> Result<(), String> {
     let engine = store();
-    let (repo, ptr) = current_pointer(engine)?;
+    let (repo, _lease_id, thread_id) = target(engine, rest)?;
     println!("running verify in a scratch copy (never the real tree)…");
-    match engine.propose_with_consent(&ptr.thread_id, &TerminalConsent)? {
+    match engine.propose_with_consent(&thread_id, &TerminalConsent)? {
         WeaveDisposition::Red { weave, .. } => Err(format!(
             "verify RED ({}) — nothing can land; the thread stays active.\n--- log tail ---\n{}",
             weave.verify.cmd, weave.verify.log_tail
@@ -228,7 +452,12 @@ fn cmd_propose() -> Result<(), String> {
             Ok(())
         }
         WeaveDisposition::Landed { land, git } => {
-            solo::clear(&engine.base(), &repo.id);
+            let is_current = solo::get(&engine.base(), &repo.id)
+                .map(|p| p.thread_id == thread_id)
+                .unwrap_or(false);
+            if is_current {
+                solo::clear(&engine.base(), &repo.id);
+            }
             println!(
                 "woven: {} files applied, fabric tip is now {}",
                 land.files_applied, land.weave.id
@@ -238,6 +467,7 @@ fn cmd_propose() -> Result<(), String> {
                 Some(Err(e)) => println!("git bridge FAILED (weave stays landed): {e}"),
                 None => {}
             }
+            autosync(engine, &repo);
             Ok(())
         }
     }
@@ -256,13 +486,32 @@ fn cmd_adopt(rest: &[String]) -> Result<(), String> {
         .first()
         .ok_or_else(|| "usage: loom adopt <thread-id> (see `loom status` for orphans)".to_string())?;
     let engine = store();
-    let (thread, lease) = engine.adopt(thread_id, &holder())?;
+    // Local first; unknown thread + a sync remote → try the claims flow.
+    let (thread, lease) = match engine.adopt(thread_id, &holder()) {
+        Ok(pair) => pair,
+        Err(e) if e.contains("no thread with id") => {
+            let repo = current_repo(engine)?;
+            if repo.sync_remote.is_some() {
+                println!("not a local thread — claiming it from a synced peer…");
+                sync::adopt_remote(engine, &repo.id, thread_id, &holder())?
+            } else {
+                return Err(e);
+            }
+        }
+        Err(e) => return Err(e),
+    };
     solo::set(&engine.base(), &thread.repo_id, &lease.id, &thread.id);
     println!("adopted {} — goal: {}", thread.id, lease.goal);
     if !lease.criteria.is_empty() {
         println!("  criteria: {}", lease.criteria.join("; "));
     }
     println!("  scope: {}", lease.scope.join(", "));
+    if let Some(wt) = &thread.worktree {
+        println!();
+        println!("  WORK IN: {wt}");
+        println!("           (the thread's worktree, last stitch materialized — continue there)");
+        println!();
+    }
     println!("  continue from the last stitch; `loom stitch` and `loom propose` as usual");
     Ok(())
 }
@@ -313,6 +562,11 @@ fn cmd_status() -> Result<(), String> {
             },
             lease_info,
         );
+        if let Some(wt) = &t.worktree {
+            if t.status.is_live() {
+                println!("        worktree: {wt}");
+            }
+        }
     }
     if rs.threads.is_empty() {
         println!("    (none — `loom lease \"<goal>\" <scope...>` to start)");
@@ -333,6 +587,31 @@ fn cmd_status() -> Result<(), String> {
             "  toe-step: '{}' vs '{}' ({} / {})",
             t.goal_a, t.goal_b, t.pattern_a, t.pattern_b
         );
+    }
+    if !rs.peers.is_empty() {
+        println!("  peers (as of last `loom sync`):");
+        let now = wall_ms();
+        for p in &rs.peers {
+            let age_s = now.saturating_sub(p.fetched_ms) / 1000;
+            println!("    {} (fetched {age_s}s ago):", p.machine);
+            for t in &p.threads {
+                let lease_dead = t
+                    .lease_id
+                    .as_ref()
+                    .and_then(|lid| p.leases.iter().find(|l| l.id == *lid))
+                    .map(|l| l.expired(now))
+                    .unwrap_or(true);
+                let adoptable =
+                    t.status == ThreadStatus::Orphaned || (t.status.is_live() && lease_dead);
+                println!(
+                    "      {} [{:?}] {}{}",
+                    t.id,
+                    t.status,
+                    t.goal,
+                    if adoptable { "  ← adoptable (loom adopt)" } else { "" }
+                );
+            }
+        }
     }
     Ok(())
 }

@@ -11,194 +11,259 @@ assumptions at once:
 - **Frequency.** An agent checkpoints every few seconds, not every few hours.
   Commit ceremony (stage → message → merge dance) is overhead per keystroke.
 - **Concurrency.** Ten agents on one repo collide constantly. Git detects the
-  collision *at merge time* — hours after the toes were stepped on. The
-  coordination information existed the whole time; git just has nowhere to put
-  it.
+  collision *at merge time* — hours after the toes were stepped on, after the
+  tokens are spent. The coordination information existed the whole time; git
+  just has nowhere to put it. A branch name is a string; nothing in git is a
+  machine-readable "I am doing X to these files", so agents cannot
+  self-partition.
 - **Green is a snapshot, not an invariant.** CI tells you a commit *was* green
   once. Nothing in git makes the shared line *stay* green while ten writers
   race it.
 - **Death is unmodeled.** An agent OOM-killed mid-refactor leaves a dirty
   worktree nobody owns. Git has no concept of "work in flight, owner gone,
   adoptable."
-- **Distribution is theoretical.** Git is distributed in storage but
-  centralized in practice (one origin, one trunk). Machines that pair up to
-  share work need peers that sync continuously without a blessed center.
+- **Merge hands reconciliation to the wrong party.** Whoever merges last —
+  often a fresh session with neither author's context — reconciles two
+  semantic rewrites, the most expensive and error-prone work agents do. The
+  goal is not faster rebases; it is **rare** rebases.
 
 Loom is not a git replacement for humans reviewing PRs. It is the
-**high-frequency collaboration layer that sits above git**: agents live in
-Loom; Loom projects its history down into ordinary git commits so every
-existing tool, host, and habit keeps working.
+coordination layer that sits above git: agents live in Loom; Loom projects
+its history down into ordinary git commits so every existing tool, host, and
+habit keeps working.
 
-## The five ideas
+## The six ideas
 
-### 1. Intent leases — say what you're about to touch
-Before editing, a thread (one agent's work-line) declares an **intent lease**:
-a scope (path globs), a goal in one sentence, and acceptance criteria
-(the same shape a done-checker would ask for). Leases are visible to every
-other thread immediately, heartbeat-renewed, and TTL-expired. Overlap does not block — it
-**warns at declaration time**, the moment coordination is still cheap: both
-threads see the collision, with a suggested split of the scope. A lease is not
-a lock; it is knowledge, enforced only where it must be (at the weave).
+### 1. Worktree isolation — a tree per task
+Every thread (one agent's work-line) gets its own **git worktree**, detached
+at HEAD, under the loom data dir — outside the repo tree, invisible to other
+threads' scopes and to git status. The holder edits there and only there.
+Right after creation the worktree's scope is **aligned to the repo's live
+tree** (the fabric may be ahead of git HEAD, since landed weaves sit in the
+working tree until committed); that aligned state is captured as the
+thread's **base** — the reference point for every merge decision later.
+In-place mode (`--in-place`, or any non-git repo) skips all of this and
+edits the repo directly, v0.1-style; isolation failures under Auto degrade
+to in-place with the reason noted on the thread, never silently.
 
-### 2. Stitches — commits at the frequency agents actually work
-A **stitch** is a micro-snapshot of the leased scope: content-addressed and
-deduplicated (v1: whole files; rolling-hash chunking and per-machine
-signatures are future work). Stitching every few seconds costs bytes, not
-ceremony — no message required; the lease's goal *is* the message. A thread
-is a chain of stitches, durable the moment it is written. In the federated
-design, peers stream each other's stitches live — live cursors for code,
-without a central server.
+### 2. Intent leases — say what you're about to touch
+Before editing, a thread declares an **intent lease**: a scope (path globs),
+a goal in one sentence, and acceptance criteria. Leases are visible to every
+other thread immediately (and to other machines after a sync), heartbeat-
+renewed, TTL-expired. Overlap does not block — it **warns at declaration
+time**, the moment coordination is still cheap: both threads see the
+collision, with a suggested split. A lease is not a lock; it is knowledge,
+enforced only where it must be (at the weave).
 
-### 3. The fabric — a mainline that is green by construction
+### 3. Stitches — commits at the frequency agents actually work
+A **stitch** is a micro-snapshot of the leased scope in the thread's working
+dir: content-addressed, deduplicated, deletion-aware. Stitching every few
+seconds costs bytes, not ceremony — no message required; the lease's goal
+*is* the message. A thread is a chain of stitches, durable the moment it is
+written.
+
+### 4. The fabric — a mainline that is green by construction
 The shared line is called the **fabric**. Nothing lands on it by push. A
-thread proposes a **weave**; the weave gate replays the thread's diff onto the
-current fabric tip, runs the verify command for the affected slice (test
-impact is tracked incrementally per scope), and advances the fabric only on
-green. Red never lands — not "shouldn't land," *cannot*: fabric advancement
-is a single atomic operation whose precondition is a green verify plus an
-explicit human yes (in the federated design, performed by whichever peer
-holds the rotating **shuttle token**). The answer to "is main green?" is
-"main is green" — by construction, always.
+thread proposes a **weave**; the gate copies the repo to scratch, overlays
+the thread's delta, runs the verify command there, and records the outcome.
+Landing a green weave is a separate, consent-gated step with file-level
+merge rules (below). Red never lands — not "shouldn't," *cannot*: fabric
+advancement is a single operation whose preconditions are a green verify, an
+explicit yes, an unmoved fabric parent, and no merge conflicts.
 
-### 4. Orphans — crash-safety for work, not just data
-When a thread's lease stops heart-beating — agent crashed, machine died,
-session hit its context limit mid-flow — the thread becomes an **orphan**:
-last stitch seconds old, goal and acceptance criteria attached, scope known.
-Orphans appear in every peer's queue as adoptable work parcels. Any agent (or
-human) **adopts** an orphan: takes over the lease, reads the goal, continues
-from the last stitch. Nothing is ever lost, and nothing dirty is ever left
-lying around unowned — abrupt death is a normal, recoverable state of work.
+### 5. Orphans — crash-safety for work, not just data
+When a thread's lease stops heart-beating, the thread becomes an **orphan**:
+last stitch seconds old, goal and criteria attached, worktree preserved.
+Orphans appear in every holder's queue (and, after sync, on every machine)
+as adoptable work parcels. Adoption hands over the same lease — goal,
+criteria, scope intact — and the worktree; an orphan arriving from another
+machine gets a fresh worktree with its last stitch materialized. Abrupt
+death is a normal, recoverable state of work.
 
-### 5. The git bridge — meet every developer where they live
-The fabric exports to a plain git branch: one git commit per weave, message
-composed from the lease goal + criteria + verify result. Threads can export as
-draft branches for human review. Humans keep GitHub, `git log`, bisect, blame;
-agents keep stitches, leases, and live sync. `git bisect` over weaves is
-strictly better than over commits: every point in fabric history passed its
-verify by construction.
+### 6. The git bridge — meet every developer where they live
+The fabric exports to plain git: one local commit per landed weave, message
+composed from goal + criteria + verify result. Never a push. Humans keep
+GitHub, `git log`, bisect, blame; agents keep stitches, leases, and sync.
+Per-thread draft-branch export (`loom export`) is future work.
+
+## Exact merge semantics (isolated threads)
+
+Definitions, per repo-relative file `f` in the thread's head stitch:
+
+- `base(f)` — hash in the thread's base stitch (the fabric snapshot taken at
+  worktree creation, refreshed by `rebase`). Absence = "did not exist".
+- `head(f)` — hash in the head stitch; the sentinel `deleted` (a tombstone)
+  records a deletion. Deletions are detected against the previous stitch and
+  the base; a first stitch with neither reference cannot see them.
+- `cur(f)` — hash of the file in the live repo tree right now; absence reads
+  as the tombstone.
+
+**Landing** (after green verify + consent, and only while the weave's
+`fabric_parent` is still the fabric tip):
+
+| condition | action |
+|---|---|
+| `head(f) == base(f)` | skip — the thread didn't change it; the fabric's current version stays, whatever it is |
+| `head(f) != base(f)` and `cur(f) == head(f)` | skip — the fabric already agrees |
+| `head(f) != base(f)` and `cur(f) == base(f)` | apply `head(f)` (write, or delete on tombstone) |
+| `head(f) != base(f)` and `cur(f) != base(f)` and `cur(f) != head(f)` | **conflict** |
+
+Any conflict refuses the whole weave — nothing is written — with the file
+list in the error and on the thread's note: *"fabric moved under you on
+`<files>` — rebase, then re-propose."* Edit-vs-edit, edit-vs-delete and
+delete-vs-edit all land in the conflict row. In-place threads have no base;
+their whole manifest applies (v0.1 semantics), which is why isolation is the
+default on git repos.
+
+**Rebase** (`loom rebase`) walks base ∪ worktree ∪ repo per file:
+
+- fabric-only changes (thread didn't touch `f`) **fast-forward** into the
+  worktree — copies, and deletions when the fabric deleted `f`;
+- thread-only changes are kept;
+- changed in **both** with disagreement: the worktree **keeps the thread's
+  version** and `f` is reported as a conflict — the holder is told to review
+  it against the repo tree before re-proposing. Nothing merges silently; the
+  informed overwrite that may follow happens behind a re-propose and a
+  fresh human yes.
+
+Then the base is re-snapshotted to the fabric's current state and the head
+stitch re-captured, so the next land measures purely against the new base. A
+Proposed thread returns to Active; any parked approval is handed back.
+
+**Hygiene.** `loom clean` removes worktrees of Woven threads only, and only
+when every file in the base ∪ head manifests still matches the last capture
+— uncaptured divergence refuses with the file list. Live threads and orphans
+are never cleaned. (Files created in a worktree after its last stitch and
+outside any manifest are undetectable here — a documented v1 limit.)
 
 ## Trust boundary
 
-Loom automates coordination, never consent. A stitch **only reads** the repo
-— snapshots go into the data dir, nothing is written back. The weave gate
-verifies **in a scratch copy**, never the real tree. Applying a green weave
-to the real working tree is an *action*: it happens only past an explicit
-human yes, expressed through the `WeaveConsent` trait — the standalone
-binary asks y/N at the terminal (showing repo, goal and verify result
-first), refuses outright when stdin is not a terminal, and the MCP server
-always refuses (its stdin is the protocol channel; no human is at it). A
-host that embeds the engine can implement consent over its own approvals
-queue instead — "auto-weave on green" would be an explicit, revocable grant,
-off by default, and is not implemented here. In the federated design,
-adopting an orphan from a remote peer gates the same way: work changes
-machines only past a human yes.
+Loom automates coordination, never consent. A stitch **only reads**. The
+weave gate verifies **in a scratch copy**. Applying a green weave to the
+real tree is an *action*: it happens only past an explicit human yes,
+expressed through the `WeaveConsent` trait — the standalone binary asks y/N
+at the terminal and refuses when stdin is not a terminal; the MCP server
+always refuses (its stdin is the protocol channel; no human is at it); an
+embedding host implements consent over its own approvals queue. "Auto-weave
+on green" would be an explicit, revocable grant, off by default, and is not
+implemented here. Cross-machine: `loom sync` shares metadata and scoped
+file blobs with the configured remote — the same exposure as pushing a
+branch there — and runs only when invoked (`--auto` is per-repo opt-in).
+Adoption claims decide races; they never move a live holder's work.
 
-## Objects (all content-addressed; signatures are future work)
+## Multi-machine sync (shipped)
+
+Any git remote both machines can push to is the whole infrastructure. All
+loom traffic rides hidden refs — never branches, tags, or checkouts:
+
+```text
+refs/loom/<machine-id>/state    published state: commit tree of
+                                  state.json        threads/leases/stitches
+                                  objects/<sha256>  scoped file blobs
+refs/loom/fabric                THE shared fabric: fabric.json = ordered
+                                landed-weave entries, each carrying its
+                                apply manifest; blobs in objects/
+refs/loom/claims/<thread-id>    orphan-adoption claims
+refs/loom/<machine-id>/mail/*   opaque mailbox payloads
+```
+
+**Sync pass order:** (1) fetch `refs/loom/*` (pruned); (2) reconcile the
+fabric — if the shared list strictly extends the local one, materialize the
+new entries' blobs and replay their apply manifests onto the local tree; if
+the local list strictly extends the shared one, publish the missing entries
+behind the CAS; equal = done; anything else = an honest "diverged" error
+that refuses to guess; (3) publish this machine's state ref (plain forced
+update of its own namespace); (4) refresh the peer view — peers' threads and
+leases are cached read-only for `status`, cross-machine toe-steps computed
+against local live leases, adoptable orphans listed.
+
+**Fabric authority is a compare-and-swap ref push:** `git push
+--force-with-lease=refs/loom/fabric:<sha-this-machine-last-fetched>`. The
+push succeeds only if the remote still has that value — git's atomic ref
+update IS the shuttle token. A lost race degrades into the same honest flow
+as a local collision: fetch, "fabric moved", rebase, re-propose. **Claims**
+use the same primitive with expected-value "absent": the earliest push wins
+deterministically and the loser is told who won.
+
+**The mailbox** carries `kind` + opaque bytes that Loom never interprets or
+verifies — sign payloads yourself if you need authenticity. It exists so
+higher layers (an embedding host's team envelopes, consent dials) can ride
+the same remote without teaching this crate their formats.
+
+**Posture:** machine ids are identity, not authentication. Anyone who can
+push to the remote can write any loom ref — the trust model is exactly "who
+you give push access to", the same as branches. Signatures are the first
+federation work item below.
+
+## Federation (design — the many-peers rung)
+
+The shipped sync assumes one blessed remote. The gossip design removes it:
+
+1. **Signatures first.** Each machine key-signs every object it authors
+   (`sig` field, serde-defaulted — no format break). Peers verify on fetch;
+   unsigned/invalid objects are quarantined, named, and never applied.
+2. **Object sync order** per peer pair: exchange log heads → fetch missing
+   stitches/leases/threads (content-addressed, so order within a kind is
+   free) → fabric entries last, applied only in fabric order. Everything is
+   append-only and idempotent; re-fetch is always safe.
+3. **Shuttle rotation** replaces the CAS ref when there is no single remote:
+   the right to advance the fabric for epoch `E` belongs to the live peer
+   minimizing `hash(E ‖ peer-key)`; a silent shuttle-holder is skipped after
+   TTL, so fabric advancement survives any machine's death. CAS-on-a-remote
+   is the degenerate single-shuttle case of the same rule — which is why the
+   shipped flow already teaches the right habits.
+4. **Adoption across gossip** reuses claims, now signed and timestamped;
+   ties break on the same hash rule.
+
+None of this changes the object model — every object already carries a
+stable id and serializes cleanly. That is the test by which the design
+stays honest: federation must be additive.
+
+## Objects
 
 | object | fields |
 |---|---|
-| `Lease` | id, thread, scope[], goal, criteria[], holder (peer key), ttl, heartbeat |
-| `Stitch` | id, thread, parent, lease, chunk-manifest, ts, sig |
-| `Thread` | id, goal, stitches head, lease, status: active · proposed · woven · orphaned · adopted |
-| `Weave` | id, thread, fabric-parent, verify {cmd, slice, result, log-digest}, shuttle-sig |
-| `Fabric` | repo id, tip weave, always-green invariant |
+| `Lease` | id, thread, scope[], goal, criteria[], holder, ttl, heartbeat |
+| `Stitch` | id, thread, parent, files{path → sha256 \| tombstone}, ts |
+| `Thread` | id, goal, head stitch, base stitch, worktree, lease, status: active · proposed · woven · orphaned · adopted, note, approval |
+| `Weave` | id, thread, fabric-parent, verify {cmd, result, log-tail}, applied{…} |
+| `Fabric` | repo id, tip weave, ordered history |
 
-Storage is a blob store + append-only logs — boring on purpose: JSON state,
-JSONL events, content-addressed whole-file blobs under `~/.loom` (override
-with `LOOM_DATA`), 0o600, bounded, corrupt-line tolerant. In the federated
-design, sync is gossip: peers exchange log heads, fetch missing objects,
-verify signatures; there is no central server and no blessed peer. The
-shuttle token rotates by deterministic schedule among live peers
-(lowest-hash-of-(epoch, peer-key) wins); a dead shuttle-holder is skipped
-after TTL, so fabric advancement survives any single machine's death. None
-of that gossip exists in v1 — see the scope section below.
+Storage is boring on purpose: JSON state + append-only JSONL events +
+content-addressed whole-file blobs under `~/.loom` (override `LOOM_DATA`),
+0o600, bounded, corrupt-line tolerant.
 
-## What a developer feels
+## Capture rules
 
-- `loom init` in a repo; other sessions' threads appear in `loom status`.
-- Your agent says "refactoring parser, leased `src/parse/**`" and every other
-  agent routes around it *before* conflict, not after.
-- Main is green. Always. You stop asking.
-- A session dies at 3am mid-migration; at 9am you (or the next agent) adopt
-  its orphan and continue from the last five-seconds-old stitch — goal and
-  acceptance criteria attached.
-- Your repo on GitHub looks like a tidy history of green, well-described
-  commits — written by a loom you watched weave in real time.
+- Built-in excludes: `.git`, `target`, `node_modules` — any entry type
+  (`.git` is a *file* inside a worktree). Never overridable.
+- `.loomignore` at the repo root extends them: one pattern per line in
+  Loom's glob grammar (`**`, `*`, `?`; a fully-literal line ignores that
+  path and everything under it), `#` comments. It cannot re-include
+  built-ins. Applies to capture and to the gate's scratch copy.
+- Files over 8 MiB are skipped and named in the stitch outcome
+  (`LOOM_MAX_FILE_MB` adjusts the cap, clamped 1–1024). Loom snapshots
+  source, not artifacts.
+- Symlinks are never followed. Manifest paths are re-validated on every
+  apply (relative, no `..`) — stored data never picks filesystem paths.
 
-## v1 in this crate (what exists today)
+## What exists in this crate today
 
-- `src/` — the engine: content-addressed blob store, stitch log, leases with
-  TTL/heartbeat, thread lifecycle incl. orphan/adopt, weave gate
-  (configurable verify command, default `cargo check`, hard timeout, scratch
-  copy), fabric log, git bridge (one local commit per landed weave — never a
-  push), and the `WeaveConsent` trait with `TerminalConsent` (interactive
-  y/N) and `AutoDeny` (non-interactive: refuses, states why).
-- `loom` CLI verbs: `init · lease · stitch · propose · withdraw · adopt ·
-  status · log`. A solo-mode pointer in the data dir remembers your current
-  lease per repo, so the everyday verbs need no ids.
-- `loom mcp` — a stdio MCP server exposing `loom_status · loom_lease ·
-  loom_stitch · loom_propose · loom_adopt`, so any agent session can use
-  Loom without the CLI. Proposing runs the verify; landing asks the human at
-  a terminal or is refused when non-interactive.
-- **Not yet** (design above, honestly absent below): federation gossip and
-  peer sync; object signatures; the shuttle token; rolling-hash chunking
-  (v1 snapshots whole files, dedup by sha256); per-slice test impact (v1
-  verifies the whole scratch copy); deletion tracking in stitches; gitignore
-  parsing (`.git`, `target`, `node_modules` are hard-coded excludes);
-  per-thread draft-branch export (`loom export`).
-
-## Quickstart — the two-terminal demo
-
-Two agents, one repo, zero merge conflicts, one dead agent recovered.
-
-```bash
-# Once, in the repo:
-loom init --verify "cargo check"       # add --git-bridge for one commit per
-                                       # landed weave (current branch, never
-                                       # a push)
-```
-
-**Terminal A** (agent A):
-
-```bash
-loom lease "extract the tokenizer" 'src/a/**' --criteria "cargo check passes"
-# edit files under src/a/ …
-loom stitch          # checkpoint — seconds-cheap, repeat as you go
-loom propose         # runs the verify in a scratch copy; on green it shows
-                     # repo, goal and verify result, then asks y/N before
-                     # anything touches the working tree
-```
-
-**Terminal B** (agent B), at the same time:
-
-```bash
-loom lease "tighten the emitter" 'src/b/**'
-# edit files under src/b/ …
-loom stitch
-loom propose
-```
-
-The scopes don't overlap, so neither lease warned. (Lease `src/a/**` twice to
-see a toe-step warning with a suggested split — the second lease still
-succeeds; a lease warns, it never blocks.) Answer `y` at each terminal:
-each weave applies to the working tree only after that yes, and `loom log`
-now shows two green weaves, the newest as the fabric tip.
-
-**Now kill agent A mid-flow.** Lease again in terminal A (short TTL so the
-demo doesn't wait 30 minutes), start editing, stitch once — then close the
-terminal and walk away:
-
-```bash
-loom lease "rename the config keys" 'src/a/**' --ttl-ms 30000   # then die
-```
-
-When the lease's TTL passes with no heartbeat, the thread appears in
-`loom status` as **orphaned** — goal, criteria and last stitch attached.
-From terminal B, `loom adopt <thread-id>`: the adopter takes over the same
-lease, reads the goal, and continues from the last stitch. Nothing was lost,
-and nothing dirty is left unowned.
-
-Agent sessions do the same thing without the CLI via `loom mcp` —
-`loom_lease → loom_stitch → loom_propose` — and every green propose still
-waits for the same human yes at a terminal. Per-thread draft-branch export
-(`loom export`) is future work and says so.
+- The engine (`lib.rs`): leases/toe-steps, worktree isolation + base
+  tracking, tombstoned stitches, the weave gate (scratch copy, hard
+  timeout), file-level merge + conflict refusal at land, rebase, orphan/
+  adopt (worktree handover + materialization), clean, consent trait
+  (terminal / auto-deny / embeddable), git bridge (local commits only).
+- `sync.rs`: the multi-machine layer above — state refs, CAS fabric,
+  claims, mailbox — implemented over the repo's own `git` binary; the
+  engine never shells git itself.
+- `loom` CLI: `init · lease · stitch · propose · rebase · withdraw · adopt ·
+  clean · sync · status · log · mcp`, with `--lease/--thread` overrides for
+  multi-seat terminals.
+- `loom mcp`: stdio MCP server — `loom_status · loom_lease · loom_stitch ·
+  loom_propose · loom_rebase · loom_adopt`. Proposing verifies; landing
+  always requires the human path.
+- **Not yet**, honestly: signatures; gossip without a blessed remote;
+  rolling-hash chunking (whole-file snapshots dedup by sha256); per-slice
+  test impact (verify is whole-repo); draft-branch export; gitignore
+  parsing beyond `.loomignore`.

@@ -180,6 +180,13 @@ pub fn detect_toe_steps(rs: &RepoState, candidate: &Lease, now_ms: u64) -> Vec<T
 /// subtree under it. Mechanical, not clever — the point is to hand both
 /// agents the same concrete starting sentence for a renegotiation.
 pub fn suggest_split(a: &str, b: &str) -> Vec<String> {
+    if a == b {
+        return vec![format!(
+            "both leases name exactly {} — coordinate directly or take turns; \
+             the later weave will be asked to rebase",
+            cap(a, 80)
+        )];
+    }
     let la = literal_prefix(a);
     let lb = literal_prefix(b);
     if !la.is_empty() && !lb.is_empty() && la != lb && !la.starts_with(&lb) && !lb.starts_with(&la)
@@ -282,6 +289,8 @@ mod tests {
             status: ThreadStatus::Active,
             note: String::new(),
             approval_id: None,
+            worktree: None,
+            base_stitch: None,
         }
     }
 
