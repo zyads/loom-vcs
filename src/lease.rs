@@ -114,10 +114,23 @@ pub fn patterns_may_overlap(a: &str, b: &str) -> bool {
             (Some(_), None) => return pb.iter().all(|s| is_literal(s)),
             (Some(&"**"), Some(_)) | (Some(_), Some(&"**")) => return true,
             (Some(x), Some(y)) => {
-                if is_literal(x) && is_literal(y) && x != y {
-                    return false;
+                // No `**` has appeared at any earlier index in either
+                // pattern (we return above the moment one does), so the
+                // segments are aligned: a path matching both must have a
+                // segment here satisfying x AND y.
+                match (is_literal(x), is_literal(y)) {
+                    // Two literals: decidable, and they must be equal.
+                    (true, true) if x != y => return false,
+                    // One literal, one wildcard: also decidable — the
+                    // segment can only be the literal, so the wildcard has
+                    // to match it (`src/*.rs` vs `src/main.py` cannot
+                    // co-match). Sound: still never under-reports.
+                    (true, false) if !match_one(y, x) => return false,
+                    (false, true) if !match_one(x, y) => return false,
+                    // Two wildcards: intersection is not decidable this
+                    // cheaply, so assume they co-match and keep walking.
+                    _ => {}
                 }
-                // Wildcard-containing segments are assumed to co-match.
                 i += 1;
             }
         }
@@ -251,6 +264,29 @@ mod tests {
         assert!(!patterns_may_overlap("src/*.rs", "src/parse/**"));
         // A consumed LITERAL pattern does.
         assert!(patterns_may_overlap("src", "src/parse/**"));
+    }
+
+    #[test]
+    fn a_literal_segment_decides_against_a_wildcard_that_cannot_match_it() {
+        // One side literal, one side wildcard: decidable, so we do decide
+        // instead of assuming co-match. Different extensions in the same
+        // directory are the everyday case.
+        assert!(!patterns_may_overlap("src/*.rs", "src/main.py"));
+        assert!(!patterns_may_overlap("src/main.py", "src/*.rs"));
+        assert!(!patterns_may_overlap("*.md", "README.rst"));
+        // ...and it still says yes when the wildcard really does match.
+        assert!(patterns_may_overlap("src/*.rs", "src/main.rs"));
+        assert!(patterns_may_overlap("src/main.rs", "src/*.rs"));
+        assert!(patterns_may_overlap("*.md", "README.md"));
+        // `?` is honoured on the same path.
+        assert!(patterns_may_overlap("src/ma?n.rs", "src/main.rs"));
+        assert!(!patterns_may_overlap("src/ma?n.rs", "src/mission.rs"));
+        // The decision is per-segment, so a later segment can still veto.
+        assert!(!patterns_may_overlap("src/*/main.rs", "src/parse/lib.rs"));
+        // Two wildcards remain a documented over-report (never under-report).
+        assert!(patterns_may_overlap("src/*.rs", "src/*.py"));
+        // `**` still short-circuits to "yes" — alignment is unknown there.
+        assert!(patterns_may_overlap("**/*.rs", "NOTES.md"));
     }
 
     #[test]
