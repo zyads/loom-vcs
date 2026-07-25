@@ -1,26 +1,26 @@
-// Loom — version control for many hands moving at once.
+// Heddle — version control for many hands moving at once.
 // Copyright (c) 2026 Aether-OS contributors. MIT license; see LICENSE.
 
 //! Multi-machine sync over any git remote — no server, no daemon, no new
 //! protocol. If two machines can push to the same private git repo, they
-//! can share a loom.
+//! can share a heddle.
 //!
 //! **The transport is git refs in a hidden namespace** (they never touch
 //! branches, tags, or anyone's checkout):
 //!
 //! ```text
-//! refs/loom/<machine-id>/state    this machine's published loom state:
+//! refs/heddle/<machine-id>/state    this machine's published heddle state:
 //!                                 a commit whose tree is
 //!                                   state.json          threads/leases/stitches
 //!                                   objects/<sha256>    scoped file blobs
-//! refs/loom/fabric                THE shared fabric: fabric.json (ordered
+//! refs/heddle/fabric                THE shared fabric: fabric.json (ordered
 //!                                 landed-weave entries, each with its apply
 //!                                 manifest) + objects/ blobs
-//! refs/loom/claims/<thread-id>    orphan-adoption claims (first push wins)
-//! refs/loom/<machine-id>/mail/*   opaque mailbox payloads (see below)
+//! refs/heddle/claims/<thread-id>    orphan-adoption claims (first push wins)
+//! refs/heddle/<machine-id>/mail/*   opaque mailbox payloads (see below)
 //! ```
 //!
-//! **Fabric authority is a compare-and-swap ref push.** `refs/loom/fabric`
+//! **Fabric authority is a compare-and-swap ref push.** `refs/heddle/fabric`
 //! advances only via `git push --force-with-lease=<ref>:<expected-sha>` —
 //! the push succeeds only if the remote still has the value this machine
 //! last fetched. Git's atomic ref update IS the shuttle token: no election,
@@ -29,8 +29,8 @@
 //! use the same primitive with an expected value of "absent": the earliest
 //! claim wins deterministically, the loser is told who won.
 //!
-//! **Consent and visibility, stated plainly:** `loom sync` shares this
-//! repo's loom metadata (goals, scopes, holders, thread status) AND the
+//! **Consent and visibility, stated plainly:** `heddle sync` shares this
+//! repo's heddle metadata (goals, scopes, holders, thread status) AND the
 //! scoped file content of stitches with the remote — the same exposure as
 //! pushing a branch there. It runs only when you run it; `--auto` (sync
 //! after every stitch/propose) is a per-repo opt-in flag you set yourself.
@@ -39,11 +39,11 @@
 //! fabric your own weaves are measured against — the same rule as one
 //! machine, now spanning several.
 //!
-//! **The mailbox** (`refs/loom/<machine-id>/mail/<id>`) carries opaque
-//! payloads: a `kind` string plus bytes Loom never interprets or verifies —
+//! **The mailbox** (`refs/heddle/<machine-id>/mail/<id>`) carries opaque
+//! payloads: a `kind` string plus bytes Heddle never interprets or verifies —
 //! sign them yourself if you need authenticity. It exists so higher layers
 //! (e.g. an embedding host's team/consent envelopes) can ride the same
-//! remote without teaching Loom their formats. Nothing in this crate reads
+//! remote without teaching Heddle their formats. Nothing in this crate reads
 //! mail content.
 //!
 //! Everything here shells out to the repo's own `git`; the engine in
@@ -56,12 +56,12 @@ use std::process::{Command, Stdio};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    now_ms, store, worktree, Lease, Loom, PeerSnapshot, RepoConfig, Stitch, Thread, ToeStep,
+    now_ms, store, worktree, Lease, Heddle, PeerSnapshot, RepoConfig, Stitch, Thread, ToeStep,
     VerifyOutcome, VerifyResult, Weave, TOMBSTONE,
 };
 
 /// The single shared fabric ref.
-pub const FABRIC_REF: &str = "refs/loom/fabric";
+pub const FABRIC_REF: &str = "refs/heddle/fabric";
 
 // ---------------------------------------------------------------------------
 // Machine identity
@@ -132,7 +132,7 @@ pub struct SharedFabric {
     pub entries: Vec<FabricEntry>,
 }
 
-/// What one `loom sync` pass did — every field an honest count or note.
+/// What one `heddle sync` pass did — every field an honest count or note.
 #[derive(Clone, Debug, Default)]
 pub struct SyncOutcome {
     pub machine: String,
@@ -142,7 +142,7 @@ pub struct SyncOutcome {
     /// Local weaves published to the shared fabric (CAS succeeded).
     pub fabric_pushed: usize,
     /// Set when the fabric CAS was refused (someone advanced it first):
-    /// the honest "fabric moved" note. Run `loom sync` again after
+    /// the honest "fabric moved" note. Run `heddle sync` again after
     /// rebasing/re-proposing local work.
     pub cas_refused: Option<String>,
     /// Peer machines whose state was fetched this pass.
@@ -164,9 +164,9 @@ fn run_git(repo: &Path, args: &[&str], stdin: Option<&[u8]>) -> Result<Vec<u8>, 
         // A deterministic identity for plumbing commits, without touching
         // the user's git config.
         .arg("-c")
-        .arg("user.name=loom-sync")
+        .arg("user.name=heddle-sync")
         .arg("-c")
-        .arg("user.email=loom@localhost")
+        .arg("user.email=heddle@localhost")
         .args(args)
         .stdin(if stdin.is_some() {
             Stdio::piped()
@@ -205,25 +205,25 @@ fn ref_sha(repo: &Path, name: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// Fetch every loom ref from the remote (pruning ones deleted there).
-/// A remote with no loom refs yet fetches cleanly to nothing.
-fn fetch_loom_refs(repo: &Path, remote: &str) -> Result<(), String> {
+/// Fetch every heddle ref from the remote (pruning ones deleted there).
+/// A remote with no heddle refs yet fetches cleanly to nothing.
+fn fetch_heddle_refs(repo: &Path, remote: &str) -> Result<(), String> {
     git_str(
         repo,
-        &["fetch", "--prune", "--quiet", remote, "+refs/loom/*:refs/loom/*"],
+        &["fetch", "--prune", "--quiet", remote, "+refs/heddle/*:refs/heddle/*"],
     )
     .map(|_| ())
 }
 
-/// Read one file out of a loom ref's commit tree.
+/// Read one file out of a heddle ref's commit tree.
 fn read_at(repo: &Path, refname: &str, path: &str) -> Result<Vec<u8>, String> {
     run_git(repo, &["cat-file", "blob", &format!("{refname}:{path}")], None)
 }
 
-/// Build a loom commit: `state_name` (a JSON blob) at the tree root plus an
+/// Build a heddle commit: `state_name` (a JSON blob) at the tree root plus an
 /// `objects/` subtree holding the given content-addressed blobs (read from
-/// the local loom object store). Returns the commit sha.
-fn write_loom_commit(
+/// the local heddle object store). Returns the commit sha.
+fn write_heddle_commit(
     repo: &Path,
     file_name: &str,
     json: &[u8],
@@ -308,14 +308,14 @@ fn push_ref(
 // The sync pass
 // ---------------------------------------------------------------------------
 
-/// One full sync pass for a repo: fetch loom refs, reconcile the shared
+/// One full sync pass for a repo: fetch heddle refs, reconcile the shared
 /// fabric (pull peers' landed weaves / publish ours via CAS), publish this
 /// machine's state, refresh the peer view and cross-machine toe-steps.
 ///
 /// `remote`/`auto` when given are persisted on the repo config first, so
-/// `loom sync --remote origin` once is enough. Blocking (git network I/O).
+/// `heddle sync --remote origin` once is enough. Blocking (git network I/O).
 pub fn sync(
-    engine: &Loom,
+    engine: &Heddle,
     repo_id: &str,
     remote: Option<&str>,
     auto: Option<bool>,
@@ -333,7 +333,7 @@ pub fn sync(
     let remote = repo
         .sync_remote
         .clone()
-        .ok_or_else(|| "no sync remote configured — run `loom sync --remote <name>` once".to_string())?;
+        .ok_or_else(|| "no sync remote configured — run `heddle sync --remote <name>` once".to_string())?;
     let repo_path = PathBuf::from(&repo.path);
     if !worktree::is_git_repo(&repo_path) {
         return Err("sync needs a git repo (the remote rides ordinary git refs)".into());
@@ -344,8 +344,8 @@ pub fn sync(
         remote: remote.clone(),
         ..Default::default()
     };
-    // 1. Fetch everything loom on the remote.
-    fetch_loom_refs(&repo_path, &remote)?;
+    // 1. Fetch everything heddle on the remote.
+    fetch_heddle_refs(&repo_path, &remote)?;
     // 2. Reconcile the shared fabric.
     reconcile_fabric(engine, &repo, &repo_path, &remote, &machine, &mut out)?;
     // 3. Publish this machine's state.
@@ -363,7 +363,7 @@ fn read_shared_fabric(repo_path: &Path) -> SharedFabric {
 }
 
 fn reconcile_fabric(
-    engine: &Loom,
+    engine: &Heddle,
     repo: &RepoConfig,
     repo_path: &Path,
     remote: &str,
@@ -438,20 +438,20 @@ fn reconcile_fabric(
         let pushed = local_ids.len() - remote_ids.len();
         let json = serde_json::to_vec_pretty(&SharedFabric { entries })
             .map_err(|e| format!("fabric json: {e}"))?;
-        let commit = write_loom_commit(
+        let commit = write_heddle_commit(
             repo_path,
             "fabric.json",
             &json,
             &objects,
             &blob_set,
-            &format!("loom fabric: {} weaves", local_ids.len()),
+            &format!("heddle fabric: {} weaves", local_ids.len()),
         )?;
         let expect = remote_sha.as_deref().unwrap_or("");
         match push_ref(repo_path, remote, &commit, FABRIC_REF, Some(expect)) {
             Ok(()) => out.fabric_pushed = pushed,
             Err(e) => {
                 // Lost the CAS race: fetch what won and say so honestly.
-                let _ = fetch_loom_refs(repo_path, remote);
+                let _ = fetch_heddle_refs(repo_path, remote);
                 out.cas_refused = Some(format!(
                     "the shared fabric moved before this machine's weaves could land on it \
                      — synced the newer fabric instead; rebase open threads and re-propose \
@@ -466,8 +466,8 @@ fn reconcile_fabric(
     }
     Err(format!(
         "this machine's fabric and the shared fabric have DIVERGED (local has {} weaves, \
-         shared has {}, and neither extends the other). Loom will not guess: land no more \
-         weaves here, `loom sync` from the machine that owns the missing history, or \
+         shared has {}, and neither extends the other). Heddle will not guess: land no more \
+         weaves here, `heddle sync` from the machine that owns the missing history, or \
          re-register this repo to start its local fabric from the shared one.",
         local_ids.len(),
         remote_ids.len()
@@ -475,7 +475,7 @@ fn reconcile_fabric(
 }
 
 fn publish_state(
-    engine: &Loom,
+    engine: &Heddle,
     repo: &RepoConfig,
     repo_path: &Path,
     remote: &str,
@@ -497,19 +497,19 @@ fn publish_state(
         .collect();
     let json = serde_json::to_vec_pretty(&state).map_err(|e| format!("state json: {e}"))?;
     let objects = store::objects_dir(&engine.base(), &repo.id);
-    let commit = write_loom_commit(
+    let commit = write_heddle_commit(
         repo_path,
         "state.json",
         &json,
         &objects,
         &blob_set,
-        &format!("loom state from {machine}"),
+        &format!("heddle state from {machine}"),
     )?;
     push_ref(
         repo_path,
         remote,
         &commit,
-        &format!("refs/loom/{machine}/state"),
+        &format!("refs/heddle/{machine}/state"),
         None,
     )
 }
@@ -517,14 +517,14 @@ fn publish_state(
 fn peer_state_refs(repo_path: &Path, machine: &str) -> Vec<(String, String)> {
     let Ok(body) = git_str(
         repo_path,
-        &["for-each-ref", "refs/loom", "--format=%(refname)"],
+        &["for-each-ref", "refs/heddle", "--format=%(refname)"],
     ) else {
         return Vec::new();
     };
     body.lines()
         .filter_map(|r| {
             let segs: Vec<&str> = r.split('/').collect();
-            // refs/loom/<machine>/state
+            // refs/heddle/<machine>/state
             if segs.len() == 4 && segs[3] == "state" && segs[2] != machine {
                 Some((segs[2].to_string(), r.to_string()))
             } else {
@@ -535,7 +535,7 @@ fn peer_state_refs(repo_path: &Path, machine: &str) -> Vec<(String, String)> {
 }
 
 fn import_peers(
-    engine: &Loom,
+    engine: &Heddle,
     repo: &RepoConfig,
     repo_path: &Path,
     machine: &str,
@@ -590,7 +590,7 @@ struct Claim {
 }
 
 /// Adopt an orphan that lives on ANOTHER machine's published state: claim
-/// it with a first-push-wins CAS on `refs/loom/claims/<thread-id>`, then
+/// it with a first-push-wins CAS on `refs/heddle/claims/<thread-id>`, then
 /// import thread + lease + stitches (blobs included) and run the normal
 /// local adoption — fresh worktree, head stitch materialized.
 ///
@@ -598,7 +598,7 @@ struct Claim {
 /// machine's own copy of the thread is untouched (it will see the claim on
 /// its next sync; v1 leaves acting on that to the humans involved).
 pub fn adopt_remote(
-    engine: &Loom,
+    engine: &Heddle,
     repo_id: &str,
     thread_id: &str,
     holder: &str,
@@ -612,10 +612,10 @@ pub fn adopt_remote(
     let remote = repo
         .sync_remote
         .clone()
-        .ok_or_else(|| "no sync remote configured — run `loom sync --remote <name>` first".to_string())?;
+        .ok_or_else(|| "no sync remote configured — run `heddle sync --remote <name>` first".to_string())?;
     let repo_path = PathBuf::from(&repo.path);
     let machine = machine_id(&engine.base());
-    fetch_loom_refs(&repo_path, &remote)?;
+    fetch_heddle_refs(&repo_path, &remote)?;
     // Find which peer published this thread.
     let mut found: Option<(String, String, PublishedState)> = None;
     for (peer_machine, refname) in peer_state_refs(&repo_path, &machine) {
@@ -629,7 +629,7 @@ pub fn adopt_remote(
         }
     }
     let (peer_machine, refname, state) = found.ok_or_else(|| {
-        format!("no peer machine has published a thread {thread_id} — `loom sync` first?")
+        format!("no peer machine has published a thread {thread_id} — `heddle sync` first?")
     })?;
     let thread = state
         .threads
@@ -661,17 +661,17 @@ pub fn adopt_remote(
     };
     let json = serde_json::to_vec_pretty(&claim).map_err(|e| format!("claim json: {e}"))?;
     let objects = store::objects_dir(&engine.base(), &repo.id);
-    let commit = write_loom_commit(
+    let commit = write_heddle_commit(
         &repo_path,
         "claim.json",
         &json,
         &objects,
         &BTreeSet::new(),
-        &format!("loom claim: {thread_id} by {machine}"),
+        &format!("heddle claim: {thread_id} by {machine}"),
     )?;
-    let claim_ref = format!("refs/loom/claims/{thread_id}");
+    let claim_ref = format!("refs/heddle/claims/{thread_id}");
     if let Err(e) = push_ref(&repo_path, &remote, &commit, &claim_ref, Some("")) {
-        let _ = fetch_loom_refs(&repo_path, &remote);
+        let _ = fetch_heddle_refs(&repo_path, &remote);
         let winner = read_at(&repo_path, &claim_ref, "claim.json")
             .ok()
             .and_then(|b| serde_json::from_slice::<Claim>(&b).ok())
@@ -704,7 +704,7 @@ pub fn adopt_remote(
 // Mailbox — opaque payloads for higher layers
 // ---------------------------------------------------------------------------
 
-/// One mailbox item, payload untouched and unverified by Loom.
+/// One mailbox item, payload untouched and unverified by Heddle.
 #[derive(Clone, Debug)]
 pub struct MailItem {
     pub machine: String,
@@ -719,11 +719,11 @@ struct MailMeta {
     ts_ms: u64,
 }
 
-/// Publish an opaque payload under this machine's mail namespace. Loom
+/// Publish an opaque payload under this machine's mail namespace. Heddle
 /// never reads, interprets or signs it — callers wanting authenticity sign
 /// the bytes themselves.
 pub fn mail_send(
-    engine: &Loom,
+    engine: &Heddle,
     repo_id: &str,
     kind: &str,
     payload: &[u8],
@@ -771,15 +771,15 @@ pub fn mail_send(
     .to_string();
     let commit = git_str(
         &repo_path,
-        &["commit-tree", &tree_oid, "-m", &format!("loom mail: {kind}")],
+        &["commit-tree", &tree_oid, "-m", &format!("heddle mail: {kind}")],
     )?;
-    let refname = format!("refs/loom/{machine}/mail/{now}");
+    let refname = format!("refs/heddle/{machine}/mail/{now}");
     push_ref(&repo_path, &remote, &commit, &refname, None)?;
     Ok(refname)
 }
 
 /// Fetch and list every peer's mailbox items (payloads included). Read-only.
-pub fn mail_list(engine: &Loom, repo_id: &str) -> Result<Vec<MailItem>, String> {
+pub fn mail_list(engine: &Heddle, repo_id: &str) -> Result<Vec<MailItem>, String> {
     let repo = engine
         .snapshot()
         .repos
@@ -791,17 +791,17 @@ pub fn mail_list(engine: &Loom, repo_id: &str) -> Result<Vec<MailItem>, String> 
         .clone()
         .ok_or_else(|| "no sync remote configured".to_string())?;
     let repo_path = PathBuf::from(&repo.path);
-    fetch_loom_refs(&repo_path, &remote)?;
+    fetch_heddle_refs(&repo_path, &remote)?;
     let Ok(body) = git_str(
         &repo_path,
-        &["for-each-ref", "refs/loom", "--format=%(refname)"],
+        &["for-each-ref", "refs/heddle", "--format=%(refname)"],
     ) else {
         return Ok(Vec::new());
     };
     let mut out = Vec::new();
     for r in body.lines() {
         let segs: Vec<&str> = r.split('/').collect();
-        // refs/loom/<machine>/mail/<id>
+        // refs/heddle/<machine>/mail/<id>
         if segs.len() == 5 && segs[3] == "mail" {
             let Ok(meta_bytes) = read_at(&repo_path, r, "mail.json") else {
                 continue;
@@ -825,7 +825,7 @@ pub fn mail_list(engine: &Loom, repo_id: &str) -> Result<Vec<MailItem>, String> 
 /// Run a sync when the repo opted into `--auto`; quiet no-op otherwise.
 /// Failures are returned for the caller to PRINT, never to abort the local
 /// operation that triggered them — local work must not hostage on a remote.
-pub fn maybe_autosync(engine: &Loom, repo: &RepoConfig) -> Option<Result<SyncOutcome, String>> {
+pub fn maybe_autosync(engine: &Heddle, repo: &RepoConfig) -> Option<Result<SyncOutcome, String>> {
     if repo.auto_sync && repo.sync_remote.is_some() {
         Some(sync(engine, &repo.id, None, None))
     } else {
@@ -841,7 +841,7 @@ mod tests {
     fn scratch(tag: &str) -> PathBuf {
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let p = std::env::temp_dir().join(format!(
-            "loom-sync-{tag}-{}-{}-{}",
+            "heddle-sync-{tag}-{}-{}-{}",
             std::process::id(),
             now_ms(),
             SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -869,8 +869,8 @@ mod tests {
         std::fs::read_to_string(p).unwrap_or_default()
     }
 
-    /// One clone of the shared bare remote, with its own loom data dir.
-    fn machine(tag: &str, bare: &Path) -> (Loom, PathBuf, RepoConfig) {
+    /// One clone of the shared bare remote, with its own heddle data dir.
+    fn machine(tag: &str, bare: &Path) -> (Heddle, PathBuf, RepoConfig) {
         let dir = scratch(&format!("{tag}-repo"));
         git_ok(
             dir.parent().unwrap(),
@@ -881,9 +881,9 @@ mod tests {
                 dir.to_str().unwrap(),
             ],
         );
-        git_ok(&dir, &["config", "user.email", "loom@test"]);
-        git_ok(&dir, &["config", "user.name", "loom test"]);
-        let engine = Loom::at(scratch(&format!("{tag}-data")));
+        git_ok(&dir, &["config", "user.email", "heddle@test"]);
+        git_ok(&dir, &["config", "user.name", "heddle test"]);
+        let engine = Heddle::at(scratch(&format!("{tag}-data")));
         let repo = engine
             .register_repo(dir.to_str().unwrap(), Some("true".into()), false)
             .expect("register");
@@ -896,8 +896,8 @@ mod tests {
         std::fs::write(src.join("f.txt"), "base\n").unwrap();
         std::fs::write(src.join("extra.txt"), "base-extra\n").unwrap();
         git_ok(&src, &["init", "-q"]);
-        git_ok(&src, &["config", "user.email", "loom@test"]);
-        git_ok(&src, &["config", "user.name", "loom test"]);
+        git_ok(&src, &["config", "user.email", "heddle@test"]);
+        git_ok(&src, &["config", "user.name", "heddle test"]);
         git_ok(&src, &["add", "-A"]);
         git_ok(&src, &["commit", "-q", "-m", "base"]);
         let bare = scratch(&format!("{tag}-bare"));

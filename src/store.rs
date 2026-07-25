@@ -1,10 +1,10 @@
-// Loom — version control for many hands moving at once.
+// Heddle — version control for many hands moving at once.
 // Copyright (c) 2026 Aether-OS contributors. MIT license; see LICENSE.
 
-//! Loom persistence — "boring on purpose":
+//! Heddle persistence — "boring on purpose":
 //!
 //! ```text
-//! <data dir>/                (default ~/.loom; LOOM_DATA overrides)
+//! <data dir>/                (default ~/.heddle; HEDDLE_DATA overrides)
 //!   repos.json               repo registry (RepoConfig list)
 //!   <repo_id>/state.json     current threads/leases/stitches/weaves/fabric
 //!   <repo_id>/log.jsonl      append-only event log (bounded by rotation)
@@ -27,14 +27,14 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use super::{LoomState, RepoConfig, RepoState};
+use super::{HeddleState, RepoConfig, RepoState};
 
 /// Log rotation threshold. At ~200 bytes/event this is thousands of events
 /// per repo — plenty of history for a status view, bounded on disk.
 pub const MAX_LOG_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Files larger than this are skipped by stitch capture (recorded in the
-/// outcome's `skipped` list) — Loom snapshots source, not artifacts.
+/// outcome's `skipped` list) — Heddle snapshots source, not artifacts.
 pub const MAX_SNAPSHOT_FILE_BYTES: u64 = 8 * 1024 * 1024;
 
 /// sha256 hex of raw bytes — the one content-address used everywhere.
@@ -65,9 +65,9 @@ pub fn worktrees_dir(base: &Path, repo_id: &str) -> PathBuf {
 }
 
 /// Load the whole picture: registry + one state per registered repo. Any
-/// unreadable or corrupt file degrades to its default — Loom would rather
+/// unreadable or corrupt file degrades to its default — Heddle would rather
 /// start an empty repo state than refuse to start.
-pub fn load(base: &Path) -> LoomState {
+pub fn load(base: &Path) -> HeddleState {
     let repos: Vec<RepoConfig> = std::fs::read_to_string(repos_path(base))
         .ok()
         .and_then(|b| serde_json::from_str(&b).ok())
@@ -80,11 +80,11 @@ pub fn load(base: &Path) -> LoomState {
             .unwrap_or_default();
         repo_states.insert(r.id.clone(), rs);
     }
-    LoomState { repos, repo_states }
+    HeddleState { repos, repo_states }
 }
 
 /// Persist registry + every repo state. Small states, whole-file writes.
-pub fn persist(base: &Path, state: &LoomState) {
+pub fn persist(base: &Path, state: &HeddleState) {
     write_json_0600(&repos_path(base), &state.repos);
     for (id, rs) in &state.repo_states {
         write_json_0600(&state_path(base, id), rs);
@@ -201,7 +201,7 @@ mod tests {
 
     fn scratch(tag: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!(
-            "loom-store-{tag}-{}-{}",
+            "heddle-store-{tag}-{}-{}",
             std::process::id(),
             super::super::now_ms()
         ));

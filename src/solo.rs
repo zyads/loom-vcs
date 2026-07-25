@@ -1,12 +1,12 @@
-// Loom — version control for many hands moving at once.
+// Heddle — version control for many hands moving at once.
 // Copyright (c) 2026 Aether-OS contributors. MIT license; see LICENSE.
 
 //! Solo-mode state pointer — "which lease am I holding right now?"
 //!
 //! The standalone CLI is one human (or one agent session) per terminal, and
-//! typing lease ids at every verb would be ceremony. `solo.json` in the loom
+//! typing lease ids at every verb would be ceremony. `solo.json` in the heddle
 //! data dir remembers, per repo, the caller's current lease + thread — set
-//! by `loom lease` and `loom adopt`, read by `stitch`/`propose`/`withdraw`/
+//! by `heddle lease` and `heddle adopt`, read by `stitch`/`propose`/`withdraw`/
 //! `status`, cleared when the thread weaves.
 //!
 //! This is a *convenience pointer*, not state the engine trusts: every verb
@@ -14,7 +14,7 @@
 //! woven, lease gone) is reported honestly and dropped rather than silently
 //! recreated. Multiple terminals sharing one data dir share one pointer per
 //! repo — solo mode means one work-line per repo at a time; use explicit ids
-//! (or one data dir per agent via `LOOM_DATA`) for anything fancier.
+//! (or one data dir per agent via `HEDDLE_DATA`) for anything fancier.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -84,7 +84,7 @@ mod tests {
 
     fn scratch(tag: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!(
-            "loom-solo-{tag}-{}-{}",
+            "heddle-solo-{tag}-{}-{}",
             std::process::id(),
             crate::now_ms()
         ));

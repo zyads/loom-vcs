@@ -1,14 +1,14 @@
-// Loom — version control for many hands moving at once.
+// Heddle — version control for many hands moving at once.
 // Copyright (c) 2026 Aether-OS contributors. MIT license; see LICENSE.
 
 //! Consent — the human yes that stands between a green verify and the real
 //! working tree.
 //!
-//! The engine's invariant is that [`crate::Loom::land_weave`] — the only
+//! The engine's invariant is that [`crate::Heddle::land_weave`] — the only
 //! path that writes into the real repo — runs only past an explicit human
 //! yes. *How* that yes is collected is the embedder's business:
 //!
-//! * The standalone `loom` binary asks at the terminal ([`TerminalConsent`]):
+//! * The standalone `heddle` binary asks at the terminal ([`TerminalConsent`]):
 //!   it shows the repo, the goal, and the verify result BEFORE asking, and
 //!   refuses outright when stdin is not a terminal — a prompt nobody can see
 //!   is not consent.
@@ -17,16 +17,16 @@
 //!   the honest answer stays *"verified green; nothing was applied."*
 //! * An embedding host with its own approvals queue implements
 //!   [`WeaveConsent`] over that queue instead (parking an approval and
-//!   resolving it later — see `Loom::mark_parked` / `Loom::reconcile_parked`
+//!   resolving it later — see `Heddle::mark_parked` / `Heddle::reconcile_parked`
 //!   for the bookkeeping that keeps async approvals honest).
 //!
-//! [`Loom::propose_with_consent`] is the shared propose→consent→land flow
+//! [`Heddle::propose_with_consent`] is the shared propose→consent→land flow
 //! for synchronous consenters (CLI, MCP): red prints nothing here and lands
 //! nothing; green asks; a refusal withdraws the thread back to Active with
-//! the reason noted, so a later `loom propose` at a real terminal can run
+//! the reason noted, so a later `heddle propose` at a real terminal can run
 //! the whole gate again.
 
-use crate::{bridge, LandOutcome, Loom, Thread, Weave};
+use crate::{bridge, LandOutcome, Heddle, Thread, Weave};
 
 /// The one question: "apply this verified-green weave to the real working
 /// tree?" `Ok(())` is an explicit yes; `Err(reason)` is a refusal with the
@@ -47,7 +47,7 @@ impl WeaveConsent for TerminalConsent {
         if !std::io::stdin().is_terminal() {
             return Err(
                 "stdin is not a terminal — refusing to apply without a human at the prompt; \
-                 re-run `loom propose` interactively"
+                 re-run `heddle propose` interactively"
                     .to_string(),
             );
         }
@@ -75,7 +75,7 @@ impl WeaveConsent for AutoDeny {
     fn confirm(&self, _summary: &str) -> Result<(), String> {
         Err(
             "non-interactive context — applying a weave to the real working tree requires an \
-             explicit human yes; run `loom propose` at a terminal"
+             explicit human yes; run `heddle propose` at a terminal"
                 .to_string(),
         )
     }
@@ -106,9 +106,9 @@ pub enum WeaveDisposition {
     },
 }
 
-impl Loom {
-    /// The full synchronous gate: run [`Loom::propose`] (scratch worktree +
-    /// verify), then on green ask `consent`, then on yes [`Loom::land_weave`]
+impl Heddle {
+    /// The full synchronous gate: run [`Heddle::propose`] (scratch worktree +
+    /// verify), then on green ask `consent`, then on yes [`Heddle::land_weave`]
     /// (+ the git bridge when the repo opted in). On refusal the thread is
     /// withdrawn back to Active with the refusal reason — re-proposable at
     /// any time. Blocking, like `propose`.
@@ -166,8 +166,8 @@ impl Loom {
 }
 
 /// File count in the thread's head stitch, best-effort (for the summary).
-fn head_stitch_files(loom: &Loom, thread_id: &str) -> usize {
-    let snap = loom.snapshot();
+fn head_stitch_files(heddle: &Heddle, thread_id: &str) -> usize {
+    let snap = heddle.snapshot();
     snap.repo_states
         .values()
         .flat_map(|rs| rs.threads.iter().map(move |t| (t, rs)))
@@ -189,7 +189,7 @@ mod tests {
 
     fn scratch(tag: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!(
-            "loom-consent-{tag}-{}-{}",
+            "heddle-consent-{tag}-{}-{}",
             std::process::id(),
             crate::now_ms()
         ));
@@ -198,16 +198,16 @@ mod tests {
         p
     }
 
-    fn rig(tag: &str, verify: &str) -> (Loom, crate::RepoConfig) {
+    fn rig(tag: &str, verify: &str) -> (Heddle, crate::RepoConfig) {
         let base = scratch(&format!("{tag}-data"));
         let repo_dir = scratch(&format!("{tag}-repo"));
         std::fs::create_dir_all(repo_dir.join("src")).unwrap();
         std::fs::write(repo_dir.join("src/main.rs"), "fn main() {}\n").unwrap();
-        let loom = Loom::at(base);
-        let repo = loom
+        let heddle = Heddle::at(base);
+        let repo = heddle
             .register_repo(repo_dir.to_str().unwrap(), Some(verify.into()), false)
             .expect("register");
-        (loom, repo)
+        (heddle, repo)
     }
 
     struct AlwaysYes;
@@ -219,12 +219,12 @@ mod tests {
 
     #[test]
     fn auto_deny_refuses_green_and_the_thread_returns_to_active_reproposable() {
-        let (loom, repo) = rig("deny", "true");
-        let d = loom
+        let (heddle, repo) = rig("deny", "true");
+        let d = heddle
             .declare_lease(&repo.id, "t", "goal", vec!["src/**".into()], vec![], None)
             .expect("lease");
-        loom.stitch(&d.lease.id).expect("stitch");
-        let disp = loom
+        heddle.stitch(&d.lease.id).expect("stitch");
+        let disp = heddle
             .propose_with_consent(&d.thread.id, &AutoDeny)
             .expect("gate runs");
         match disp {
@@ -240,10 +240,10 @@ mod tests {
             other => panic!("expected Refused, got {other:?}"),
         }
         // Nothing landed.
-        let snap = loom.snapshot();
+        let snap = heddle.snapshot();
         assert!(snap.repo_states[&repo.id].fabric.tip.is_none());
         // Recovery is real: consent that says yes lands on re-propose.
-        let disp = loom
+        let disp = heddle
             .propose_with_consent(&d.thread.id, &AlwaysYes)
             .expect("re-propose");
         match disp {
@@ -253,7 +253,7 @@ mod tests {
             }
             other => panic!("expected Landed, got {other:?}"),
         }
-        assert!(loom.snapshot().repo_states[&repo.id].fabric.tip.is_some());
+        assert!(heddle.snapshot().repo_states[&repo.id].fabric.tip.is_some());
     }
 
     #[test]
@@ -264,12 +264,12 @@ mod tests {
                 panic!("consent must never be asked for a red verify");
             }
         }
-        let (loom, repo) = rig("red", "false");
-        let d = loom
+        let (heddle, repo) = rig("red", "false");
+        let d = heddle
             .declare_lease(&repo.id, "t", "goal", vec!["src/**".into()], vec![], None)
             .expect("lease");
-        loom.stitch(&d.lease.id).expect("stitch");
-        let disp = loom
+        heddle.stitch(&d.lease.id).expect("stitch");
+        let disp = heddle
             .propose_with_consent(&d.thread.id, &MustNotAsk)
             .expect("gate runs");
         match disp {
@@ -279,6 +279,6 @@ mod tests {
             }
             other => panic!("expected Red, got {other:?}"),
         }
-        assert!(loom.snapshot().repo_states[&repo.id].fabric.tip.is_none());
+        assert!(heddle.snapshot().repo_states[&repo.id].fabric.tip.is_none());
     }
 }

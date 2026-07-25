@@ -1,4 +1,4 @@
-// Loom — version control for many hands moving at once.
+// Heddle — version control for many hands moving at once.
 // Copyright (c) 2026 Aether-OS contributors. MIT license; see LICENSE.
 
 //! Stitch capture, the weave gate's scratch worktree, and overlay apply.
@@ -30,23 +30,33 @@ use super::{now_ms, RepoConfig, VerifyOutcome, VerifyResult, TOMBSTONE};
 
 /// Names never captured, never copied into scratch worktrees, whatever the
 /// entry type — `.git` in particular is a *file* inside a git worktree.
-/// Always excluded; a `.loomignore` can only ADD to this list, never
+/// Always excluded; a `.heddleignore` can only ADD to this list, never
 /// un-ignore it.
 pub const EXCLUDED_DIRS: &[&str] = &[".git", "target", "node_modules"];
 
 /// Per-repo ignore file at the repo (or worktree) root: one pattern per
-/// line in Loom's own glob grammar (`**`, `*`, `?`; a fully-literal line
+/// line in Heddle's own glob grammar (`**`, `*`, `?`; a fully-literal line
 /// ignores that file or everything under that directory), `#` comments and
 /// blank lines skipped. Applied AFTER the built-in excludes above — it
 /// extends them and cannot re-include them.
-pub const LOOMIGNORE_FILE: &str = ".loomignore";
+pub const HEDDLEIGNORE_FILE: &str = ".heddleignore";
 
-/// Load the root's `.loomignore` patterns (empty when absent/unreadable).
+/// Pre-rename ignore file name (formerly loom-vcs), still read as a
+/// fallback when no `.heddleignore` exists at the root.
+pub const LOOMIGNORE_FALLBACK_FILE: &str = ".loomignore";
+
+/// Load the root's `.heddleignore` patterns (empty when absent/unreadable).
+/// A pre-rename `.loomignore` is read as a fallback when `.heddleignore`
+/// is absent; when both exist, only `.heddleignore` applies.
 /// Invalid patterns (absolute, `..`, backslashes) are dropped silently —
 /// an ignore file must never become a path-escape vector.
-pub fn load_loomignore(root: &Path) -> Vec<String> {
-    let Ok(body) = std::fs::read_to_string(root.join(LOOMIGNORE_FILE)) else {
-        return Vec::new();
+pub fn load_heddleignore(root: &Path) -> Vec<String> {
+    let body = match std::fs::read_to_string(root.join(HEDDLEIGNORE_FILE)) {
+        Ok(body) => body,
+        Err(_) => match std::fs::read_to_string(root.join(LOOMIGNORE_FALLBACK_FILE)) {
+            Ok(body) => body,
+            Err(_) => return Vec::new(),
+        },
     };
     body.lines()
         .map(|l| l.trim().trim_start_matches("./").to_string())
@@ -90,7 +100,7 @@ pub fn capture_scope(
     scope: &[String],
     objects: &Path,
 ) -> Result<Captured, String> {
-    let ignore = load_loomignore(root);
+    let ignore = load_heddleignore(root);
     let max_bytes = max_snapshot_bytes();
     let mut manifest = BTreeMap::new();
     let mut skipped = Vec::new();
@@ -112,7 +122,10 @@ pub fn capture_scope(
             }
             // Built-in excludes apply to ANY entry type: `.git` is a file
             // inside a git worktree.
-            if EXCLUDED_DIRS.contains(&name.as_str()) || name == LOOMIGNORE_FILE {
+            if EXCLUDED_DIRS.contains(&name.as_str())
+                || name == HEDDLEIGNORE_FILE
+                || name == LOOMIGNORE_FALLBACK_FILE
+            {
                 continue;
             }
             let Some(rel) = relative_slash(root, &path) else {
@@ -137,7 +150,7 @@ pub fn capture_scope(
                 Ok(m) if m.len() > max_bytes => {
                     skipped.push(format!(
                         "{rel} (too large: {} bytes > the {} MiB snapshot cap — \
-                         raise LOOM_MAX_FILE_MB or .loomignore it)",
+                         raise HEDDLE_MAX_FILE_MB or .heddleignore it)",
                         m.len(),
                         max_bytes / (1024 * 1024),
                     ));
@@ -175,7 +188,7 @@ pub fn run_gate(
     // scratch dir — one's cleanup would eat the other's verify log.
     static GATE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let scratch = std::env::temp_dir().join(format!(
-        "loom-gate-{}-{}-{}",
+        "heddle-gate-{}-{}-{}",
         std::process::id(),
         now_ms(),
         GATE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -340,9 +353,9 @@ pub fn diff_vs_worktree(root: &Path, manifest: &BTreeMap<String, String>) -> ser
 }
 
 /// Recursive copy skipping [`EXCLUDED_DIRS`] (any entry type), symlinks and
-/// `.loomignore` matches.
+/// `.heddleignore` matches.
 pub fn copy_tree(src: &Path, dst: &Path) -> Result<(), String> {
-    let ignore = load_loomignore(src);
+    let ignore = load_heddleignore(src);
     copy_tree_rec(src, dst, src, &ignore)
 }
 
@@ -374,13 +387,15 @@ fn copy_tree_rec(src: &Path, dst: &Path, root: &Path, ignore: &[String]) -> Resu
 }
 
 /// The per-file snapshot cap: [`MAX_SNAPSHOT_FILE_BYTES`] (8 MiB) unless
-/// the `LOOM_MAX_FILE_MB` env var picks another ceiling (clamped 1–1024).
+/// the `HEDDLE_MAX_FILE_MB` env var picks another ceiling (clamped 1–1024;
+/// the pre-rename `LOOM_MAX_FILE_MB` is honored as a silent fallback).
 /// Larger files are SKIPPED and named in the stitch outcome's `skipped`
-/// list — loom snapshots source, not artifacts; put artifacts in
-/// `.loomignore` instead of raising the cap.
+/// list — heddle snapshots source, not artifacts; put artifacts in
+/// `.heddleignore` instead of raising the cap.
 pub fn max_snapshot_bytes() -> u64 {
-    std::env::var("LOOM_MAX_FILE_MB")
+    std::env::var("HEDDLE_MAX_FILE_MB")
         .ok()
+        .or_else(|| std::env::var("LOOM_MAX_FILE_MB").ok())
         .and_then(|v| v.trim().parse::<u64>().ok())
         .map(|mb| mb.clamp(1, 1024) * 1024 * 1024)
         .unwrap_or(MAX_SNAPSHOT_FILE_BYTES)
@@ -394,7 +409,7 @@ pub fn run_verify(cmd: &str, cwd: &Path, timeout_secs: u64) -> VerifyOutcome {
     // here, and a log file inside the tree would be staged into the commit.
     static LOG_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let log_path = std::env::temp_dir().join(format!(
-        "loom-verify-{}-{}-{}.log",
+        "heddle-verify-{}-{}-{}.log",
         std::process::id(),
         now_ms(),
         LOG_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -500,7 +515,7 @@ mod tests {
 
     fn scratch(tag: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!(
-            "loom-weave-{tag}-{}-{}",
+            "heddle-weave-{tag}-{}-{}",
             std::process::id(),
             now_ms()
         ));
@@ -535,7 +550,7 @@ mod tests {
     }
 
     #[test]
-    fn loomignore_extends_the_builtin_excludes_for_capture_and_copy() {
+    fn heddleignore_extends_the_builtin_excludes_for_capture_and_copy() {
         let repo = scratch("ign");
         for (rel, body) in [
             ("src/keep.rs", "kept"),
@@ -548,7 +563,7 @@ mod tests {
             std::fs::write(p, body).unwrap();
         }
         std::fs::write(
-            repo.join(".loomignore"),
+            repo.join(".heddleignore"),
             "# artifacts\nlogs\n**/*.tmp.rs\n../evil\n",
         )
         .unwrap();
@@ -557,7 +572,7 @@ mod tests {
         assert_eq!(
             c.manifest.keys().cloned().collect::<Vec<_>>(),
             vec!["src/keep.rs".to_string()],
-            ".loomignore itself, its patterns, and built-ins all excluded"
+            ".heddleignore itself, its patterns, and built-ins all excluded"
         );
         // The gate's scratch copy honors the same rules.
         let dst = scratch("ign-copy");

@@ -1,10 +1,10 @@
-// Loom — version control for many hands moving at once.
+// Heddle — version control for many hands moving at once.
 // Copyright (c) 2026 Aether-OS contributors. MIT license; see LICENSE.
 
 //! Per-thread git worktree isolation — the mechanism that makes two threads
 //! on one repo physically unable to clobber each other's edits.
 //!
-//! An **isolated** thread gets its own `git worktree` under the loom data
+//! An **isolated** thread gets its own `git worktree` under the heddle data
 //! dir (`<data>/<repo_id>/worktrees/<thread-id>` — outside the repo's own
 //! tree, so it never shows up in anyone's scope or git status). The holder
 //! edits THERE; stitches capture from there; the real repo tree changes only
@@ -85,7 +85,7 @@ mod tests {
 
     fn scratch(tag: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!(
-            "loom-wt-{tag}-{}-{}",
+            "heddle-wt-{tag}-{}-{}",
             std::process::id(),
             crate::now_ms()
         ));
@@ -99,8 +99,8 @@ mod tests {
         let dir = scratch(tag);
         for args in [
             vec!["init", "-q"],
-            vec!["config", "user.email", "loom@test"],
-            vec!["config", "user.name", "loom test"],
+            vec!["config", "user.email", "heddle@test"],
+            vec!["config", "user.name", "heddle test"],
         ] {
             git(&dir, &args).expect("git setup");
         }

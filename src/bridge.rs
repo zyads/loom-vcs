@@ -1,4 +1,4 @@
-// Loom — version control for many hands moving at once.
+// Heddle — version control for many hands moving at once.
 // Copyright (c) 2026 Aether-OS contributors. MIT license; see LICENSE.
 
 //! The git bridge — meet every developer where they live.
@@ -12,19 +12,19 @@
 //!   composed from the lease goal + criteria + the verify result. One lease
 //!   = one goal = one commit — the intended granularity.
 //! * **`stitches`**: the thread's stitch chain replays as individual
-//!   commits on a per-thread branch `loom/<thread-id-short>-<goal-slug>`
+//!   commits on a per-thread branch `heddle/<thread-id-short>-<goal-slug>`
 //!   ("stitch N of <goal>" + changed-file list each), then that branch
 //!   merges into the current branch with a merge commit carrying the weave
 //!   message. History shows every checkpoint AND the semantic landing.
 //! * **`both`**: squash commit on the current branch + the per-thread
 //!   branch preserved (not merged) for archaeology.
 //!
-//! `loom export` reuses the same replay to write an UNLANDED thread's chain
+//! `heddle export` reuses the same replay to write an UNLANDED thread's chain
 //! to its per-thread branch for human review — see [`build_thread_branch`].
 //!
 //! **Replay mechanics (plumbing only).** Each stitch commit is built with a
 //! temporary index file (`GIT_INDEX_FILE`): `read-tree` the parent commit's
-//! tree, batch-import the changed blobs from loom's content-addressed store
+//! tree, batch-import the changed blobs from heddle's content-addressed store
 //! via `hash-object -w --stdin-paths`, stage adds/edits/tombstones with
 //! `update-index -z --index-info`, then `write-tree` + `commit-tree` +
 //! `update-ref refs/heads/<branch>`. Chosen over a scratch worktree because
@@ -74,7 +74,7 @@ pub fn commit_message(out: &LandOutcome) -> String {
     }
     msg.push_str(&format!("\nverify: green ({})\n", out.weave.verify.cmd));
     msg.push_str(&format!(
-        "\nwoven-by: loom thread={} weave={}\n",
+        "\nwoven-by: heddle thread={} weave={}\n",
         out.thread.id, out.weave.id
     ));
     msg
@@ -108,7 +108,7 @@ fn squash_commit(out: &LandOutcome, repo_dir: &Path) -> Result<String, String> {
     // pick it up; -F keeps the message out of shell quoting entirely.
     static MSG_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let msg_file = std::env::temp_dir().join(format!(
-        "loom-commit-msg-{}-{}-{}",
+        "heddle-commit-msg-{}-{}-{}",
         std::process::id(),
         super::now_ms(),
         MSG_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -210,7 +210,7 @@ pub fn head_commit(repo_dir: &Path) -> Result<String, String> {
 }
 
 /// The per-thread branch a thread's checkpoints replay onto:
-/// `loom/<thread-id-short>-<goal-slug>`. Deterministic, so land and export
+/// `heddle/<thread-id-short>-<goal-slug>`. Deterministic, so land and export
 /// refresh the same branch.
 pub fn thread_branch_name(thread_id: &str, goal: &str) -> String {
     let short = thread_id.strip_prefix("thread-").unwrap_or(thread_id);
@@ -227,9 +227,9 @@ pub fn thread_branch_name(thread_id: &str, goal: &str) -> String {
     let slug: String = slug.chars().take(40).collect();
     let slug = slug.trim_end_matches('-');
     if slug.is_empty() {
-        format!("loom/{short}")
+        format!("heddle/{short}")
     } else {
-        format!("loom/{short}-{slug}")
+        format!("heddle/{short}-{slug}")
     }
 }
 
@@ -242,7 +242,7 @@ pub fn thread_branch_name(thread_id: &str, goal: &str) -> String {
 ///
 /// Pure plumbing on a temporary index — the user's working tree, real
 /// index, and current branch are never touched. Blob content comes from
-/// loom's object store; a missing blob is an honest error.
+/// heddle's object store; a missing blob is an honest error.
 pub fn build_thread_branch(
     repo_dir: &Path,
     base_commit: &str,
@@ -261,7 +261,7 @@ pub fn build_thread_branch(
     )?;
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let index = std::env::temp_dir().join(format!(
-        "loom-bridge-index-{}-{}-{}",
+        "heddle-bridge-index-{}-{}-{}",
         std::process::id(),
         super::now_ms(),
         SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -279,7 +279,7 @@ pub fn build_thread_branch(
             let mut rels: Vec<&String> = prev.keys().chain(st.files.keys()).collect();
             rels.sort();
             rels.dedup();
-            let mut adds: Vec<(String, String)> = Vec::new(); // rel → loom hash
+            let mut adds: Vec<(String, String)> = Vec::new(); // rel → heddle hash
             let mut dels: Vec<String> = Vec::new();
             for rel in rels {
                 let before = eff(&prev, rel);
@@ -303,7 +303,7 @@ pub fn build_thread_branch(
                 None,
                 &["read-tree", &parent_tree],
             )?;
-            // Batch-import changed blobs from the loom store into git's
+            // Batch-import changed blobs from the heddle store into git's
             // object db; output oids come back in input order.
             let mut oids: Vec<String> = Vec::new();
             if !adds.is_empty() {
@@ -311,7 +311,7 @@ pub fn build_thread_branch(
                 for (rel, h) in &adds {
                     let p = super::store::blob_path(objects, h);
                     if !p.exists() {
-                        return Err(format!("blob for {rel} ({h}) missing from the loom store"));
+                        return Err(format!("blob for {rel} ({h}) missing from the heddle store"));
                     }
                     paths.push_str(&p.to_string_lossy());
                     paths.push('\n');
@@ -437,7 +437,7 @@ fn git(
 #[cfg(test)]
 mod tests {
     use super::super::{
-        Loom, RepoConfig, Thread, ThreadStatus, VerifyOutcome, Weave,
+        Heddle, RepoConfig, Thread, ThreadStatus, VerifyOutcome, Weave,
     };
     use super::*;
     use std::path::PathBuf;
@@ -503,7 +503,7 @@ mod tests {
             .unwrap_err()
             .contains("git bridge is off"));
         out.repo.git_bridge = true;
-        let plain = std::env::temp_dir().join(format!("loom-nogit-{}", std::process::id()));
+        let plain = std::env::temp_dir().join(format!("heddle-nogit-{}", std::process::id()));
         std::fs::create_dir_all(&plain).unwrap();
         out.repo.path = plain.to_string_lossy().to_string();
         assert!(commit_landed_weave(&out).unwrap_err().contains("not a git repo"));
@@ -526,7 +526,7 @@ mod tests {
 
     fn scratch(tag: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!(
-            "loom-bridge-{tag}-{}-{}",
+            "heddle-bridge-{tag}-{}-{}",
             std::process::id(),
             super::super::now_ms()
         ));
@@ -550,7 +550,7 @@ mod tests {
     }
 
     /// A real git repo with one commit, registered with the bridge on.
-    fn git_rig(tag: &str, mode: BridgeMode) -> (Loom, PathBuf, RepoConfig) {
+    fn git_rig(tag: &str, mode: BridgeMode) -> (Heddle, PathBuf, RepoConfig) {
         let base = scratch(&format!("{tag}-data"));
         let repo_dir = scratch(&format!("{tag}-repo"));
         std::fs::create_dir_all(repo_dir.join("src")).unwrap();
@@ -558,29 +558,29 @@ mod tests {
         std::fs::write(repo_dir.join("src/util.rs"), "pub fn u() {}\n").unwrap();
         for args in [
             vec!["git", "init", "-q"],
-            vec!["git", "config", "user.email", "loom@test"],
-            vec!["git", "config", "user.name", "loom test"],
+            vec!["git", "config", "user.email", "heddle@test"],
+            vec!["git", "config", "user.name", "heddle test"],
             vec!["git", "add", "-A"],
             vec!["git", "commit", "-q", "-m", "base"],
         ] {
             sh(&repo_dir, &args);
         }
-        let loom = Loom::at(base);
-        let repo = loom
+        let heddle = Heddle::at(base);
+        let repo = heddle
             .register_repo(repo_dir.to_str().unwrap(), Some("true".into()), true)
             .expect("register");
-        let repo = loom.set_bridge_mode(&repo.id, mode).expect("set mode");
-        (loom, repo_dir, repo)
+        let repo = heddle.set_bridge_mode(&repo.id, mode).expect("set mode");
+        (heddle, repo_dir, repo)
     }
 
     /// Lease → edit(s)+stitch(es) → propose → land, returning the LandOutcome.
     fn land_one(
-        loom: &Loom,
+        heddle: &Heddle,
         repo: &RepoConfig,
         goal: &str,
         edits: &[&[(&str, &str)]],
     ) -> LandOutcome {
-        let d = loom
+        let d = heddle
             .declare_lease(&repo.id, "t", goal, vec!["src/**".into()], vec!["tests pass".into()], None)
             .expect("lease");
         let wt = PathBuf::from(d.thread.worktree.as_ref().expect("isolated"));
@@ -588,19 +588,19 @@ mod tests {
             for (rel, body) in *batch {
                 std::fs::write(wt.join(rel), body).unwrap();
             }
-            let s = loom.stitch(&d.lease.id).expect("stitch");
+            let s = heddle.stitch(&d.lease.id).expect("stitch");
             assert!(!s.unchanged, "each batch changes something");
         }
-        let p = loom.propose(&d.thread.id).expect("propose");
+        let p = heddle.propose(&d.thread.id).expect("propose");
         assert!(p.green);
-        loom.land_weave(&p.weave.id).expect("land")
+        heddle.land_weave(&p.weave.id).expect("land")
     }
 
     #[test]
     fn squash_mode_projects_one_commit_per_weave() {
-        let (loom, repo_dir, repo) = git_rig("squash", BridgeMode::Squash);
+        let (heddle, repo_dir, repo) = git_rig("squash", BridgeMode::Squash);
         let out = land_one(
-            &loom,
+            &heddle,
             &repo,
             "greet in french",
             &[&[("src/main.rs", "fn main() { /* bonjour */ }\n")]],
@@ -617,9 +617,9 @@ mod tests {
 
     #[test]
     fn stitches_mode_replays_checkpoints_and_merges_with_the_weave_message() {
-        let (loom, repo_dir, repo) = git_rig("stitches", BridgeMode::Stitches);
+        let (heddle, repo_dir, repo) = git_rig("stitches", BridgeMode::Stitches);
         let out = land_one(
-            &loom,
+            &heddle,
             &repo,
             "rework main twice",
             &[
@@ -634,7 +634,7 @@ mod tests {
         let note = commit_landed_weave(&out).expect("bridge");
         assert!(note.contains("replayed 2 stitch commit(s)"), "{note}");
         let branch = thread_branch_name(&out.thread.id, &out.thread.goal);
-        assert!(branch.starts_with("loom/"), "{branch}");
+        assert!(branch.starts_with("heddle/"), "{branch}");
         assert!(branch.ends_with("-rework-main-twice"), "{branch}");
         // The branch: base + 2 checkpoint commits, message shape asserted.
         assert_eq!(sh(&repo_dir, &["git", "rev-list", "--count", &branch]), "3");
@@ -662,9 +662,9 @@ mod tests {
 
     #[test]
     fn both_mode_squashes_and_keeps_the_branch_unmerged() {
-        let (loom, repo_dir, repo) = git_rig("both", BridgeMode::Both);
+        let (heddle, repo_dir, repo) = git_rig("both", BridgeMode::Both);
         let out = land_one(
-            &loom,
+            &heddle,
             &repo,
             "tune util",
             &[&[("src/util.rs", "pub fn u() { /* tuned */ }\n")]],
@@ -690,23 +690,23 @@ mod tests {
     #[test]
     fn export_writes_the_branch_without_landing_or_dirtying_anything() {
         // Bridge OFF: export must still work — it is review, not landing.
-        let (loom, repo_dir, _repo) = git_rig("export", BridgeMode::Squash);
-        let repo = loom
+        let (heddle, repo_dir, _repo) = git_rig("export", BridgeMode::Squash);
+        let repo = heddle
             .register_repo(repo_dir.to_str().unwrap(), Some("true".into()), false)
             .expect("re-register bridge off");
-        let d = loom
+        let d = heddle
             .declare_lease(&repo.id, "t", "in flight work", vec!["src/**".into()], vec![], None)
             .expect("lease");
         let wt = PathBuf::from(d.thread.worktree.as_ref().unwrap());
         // Exporting before any stitch refuses honestly.
-        let err = loom.export_thread(&d.thread.id).unwrap_err();
+        let err = heddle.export_thread(&d.thread.id).unwrap_err();
         assert!(err.contains("capture a stitch first"), "{err}");
         std::fs::write(wt.join("src/main.rs"), "fn main() { /* wip 1 */ }\n").unwrap();
-        loom.stitch(&d.lease.id).expect("stitch 1");
+        heddle.stitch(&d.lease.id).expect("stitch 1");
         std::fs::write(wt.join("src/main.rs"), "fn main() { /* wip 2 */ }\n").unwrap();
-        loom.stitch(&d.lease.id).expect("stitch 2");
+        heddle.stitch(&d.lease.id).expect("stitch 2");
         let head_before = sh(&repo_dir, &["git", "rev-parse", "HEAD"]);
-        let out = loom.export_thread(&d.thread.id).expect("export");
+        let out = heddle.export_thread(&d.thread.id).expect("export");
         assert_eq!(out.commits, 2);
         assert!(out.branch.contains("in-flight-work"), "{}", out.branch);
         // The branch holds the in-flight chain…
@@ -723,7 +723,7 @@ mod tests {
         );
         assert_eq!(sh(&repo_dir, &["git", "rev-parse", "HEAD"]), head_before);
         assert_eq!(sh(&repo_dir, &["git", "status", "--porcelain"]), "");
-        let snap = loom.snapshot();
+        let snap = heddle.snapshot();
         assert!(snap.repo_states[&repo.id].fabric.tip.is_none());
         assert_eq!(
             snap.repo_states[&repo.id].threads[0].status,
@@ -731,15 +731,15 @@ mod tests {
         );
         // Re-export after more work refreshes the SAME branch.
         std::fs::write(wt.join("src/main.rs"), "fn main() { /* wip 3 */ }\n").unwrap();
-        loom.stitch(&d.lease.id).expect("stitch 3");
-        let again = loom.export_thread(&d.thread.id).expect("re-export");
+        heddle.stitch(&d.lease.id).expect("stitch 3");
+        let again = heddle.export_thread(&d.thread.id).expect("re-export");
         assert_eq!(again.branch, out.branch);
         assert_eq!(again.commits, 3);
     }
 
     #[test]
     fn empty_diff_stitches_are_skipped_in_replay() {
-        let (_loom, repo_dir, _repo) = git_rig("skip", BridgeMode::Squash);
+        let (_heddle, repo_dir, _repo) = git_rig("skip", BridgeMode::Squash);
         let objects = scratch("skip-obj");
         let h1 = super::super::store::put_blob(&objects, b"one\n").unwrap();
         let mk = |id: &str, parent: Option<&str>, files: &[(&str, &str)]| Stitch {
@@ -760,7 +760,7 @@ mod tests {
         let n = build_thread_branch(
             &repo_dir,
             &head,
-            "loom/skip-test",
+            "heddle/skip-test",
             "skip test",
             &[s1, s2, s3],
             &BTreeMap::new(),
@@ -769,19 +769,19 @@ mod tests {
         .expect("replay");
         assert_eq!(n, 2, "the identical stitch made no commit");
         assert_eq!(
-            sh(&repo_dir, &["git", "rev-list", "--count", "loom/skip-test"]),
+            sh(&repo_dir, &["git", "rev-list", "--count", "heddle/skip-test"]),
             "3"
         );
-        let subjects = sh(&repo_dir, &["git", "log", "--format=%s", "loom/skip-test"]);
+        let subjects = sh(&repo_dir, &["git", "log", "--format=%s", "heddle/skip-test"]);
         assert!(subjects.contains("stitch 1 of skip test"), "{subjects}");
         assert!(
             subjects.contains("stitch 3 of skip test"),
             "numbering follows the chain, not the commits: {subjects}"
         );
-        let body = sh(&repo_dir, &["git", "log", "-1", "--format=%B", "loom/skip-test"]);
+        let body = sh(&repo_dir, &["git", "log", "-1", "--format=%B", "heddle/skip-test"]);
         assert!(body.contains("- src/new.rs (deleted)"), "{body}");
         // Tombstone applied: the file is gone from the tip tree.
-        let ls = sh(&repo_dir, &["git", "ls-tree", "-r", "--name-only", "loom/skip-test"]);
+        let ls = sh(&repo_dir, &["git", "ls-tree", "-r", "--name-only", "heddle/skip-test"]);
         assert!(!ls.contains("src/new.rs"), "{ls}");
         assert!(ls.contains("src/main.rs"), "{ls}");
         // And the working tree was never touched.
