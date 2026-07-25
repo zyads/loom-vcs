@@ -169,7 +169,10 @@ pub fn read_blob(objects: &Path, hash: &str) -> Result<Vec<u8>, String> {
     std::fs::read(blob_path(objects, hash)).map_err(|e| format!("blob {hash} unreadable: {e}"))
 }
 
-fn blob_path(objects: &Path, hash: &str) -> PathBuf {
+/// Where a content hash lives on disk. Crate-visible so the git bridge can
+/// hand blob files straight to `git hash-object --stdin-paths` without
+/// copying the bytes through memory.
+pub(crate) fn blob_path(objects: &Path, hash: &str) -> PathBuf {
     objects.join(&hash[..2]).join(hash)
 }
 
