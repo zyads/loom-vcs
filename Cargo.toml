@@ -1,0 +1,31 @@
+# Loom — version control for many hands moving at once.
+# MIT license; see LICENSE. Standalone: deliberately tiny (serde for the
+# objects, sha2+hex for content addressing). The engine is synchronous — no
+# async runtime.
+#
+# The package is `loom-vcs` (crates.io `loom` belongs to tokio's concurrency
+# checker); the library and the installed binary are both still named `loom`.
+[package]
+name = "loom-vcs"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Version control for many hands moving at once: intent leases, stitches, and a fabric that is green by construction — a high-frequency collaboration layer above git."
+repository = "https://github.com/zyads/loom-vcs"
+
+[lib]
+name = "loom"
+path = "src/lib.rs"
+
+[[bin]]
+name = "loom"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+sha2 = "0.10.9"
+hex = "0.4.3"
+
+# Standalone crate: detach from any enclosing cargo workspace.
+[workspace]
