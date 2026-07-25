@@ -1,4 +1,4 @@
-# Loom — version control for many hands moving at once
+# Heddle — version control for many hands moving at once
 
 *Threads woven into a fabric that is green by construction.*
 
@@ -27,8 +27,8 @@ assumptions at once:
   semantic rewrites, the most expensive and error-prone work agents do. The
   goal is not faster rebases; it is **rare** rebases.
 
-Loom is not a git replacement for humans reviewing PRs. It is the
-coordination layer that sits above git: agents live in Loom; Loom projects
+Heddle is not a git replacement for humans reviewing PRs. It is the
+coordination layer that sits above git: agents live in Heddle; Heddle projects
 its history down into ordinary git commits so every existing tool, host, and
 habit keeps working.
 
@@ -36,7 +36,7 @@ habit keeps working.
 
 ### 1. Worktree isolation — a tree per task
 Every thread (one agent's work-line) gets its own **git worktree**, detached
-at HEAD, under the loom data dir — outside the repo tree, invisible to other
+at HEAD, under the heddle data dir — outside the repo tree, invisible to other
 threads' scopes and to git status. The holder edits there and only there.
 Right after creation the worktree's scope is **aligned to the repo's live
 tree** (the fabric may be ahead of git HEAD, since landed weaves sit in the
@@ -84,11 +84,11 @@ death is a normal, recoverable state of work.
 The fabric exports to plain git at a per-repo granularity (`bridge_mode`):
 `squash` (default) — one local commit per landed weave, message composed
 from goal + criteria + verify result; `stitches` — the thread's checkpoint
-chain replays as commits on a `loom/<thread>-<goal>` branch (temp-index
+chain replays as commits on a `heddle/<thread>-<goal>` branch (temp-index
 plumbing, never the working tree), merged with the weave message; `both` —
 squash plus the branch kept unmerged. Never a push, in any mode. Humans
 keep GitHub, `git log`, bisect, blame; agents keep stitches, leases, and
-sync. `loom export` writes an UNLANDED thread's chain to the same branch
+sync. `heddle export` writes an UNLANDED thread's chain to the same branch
 for human review of in-flight work.
 
 ## Exact merge semantics (isolated threads)
@@ -120,7 +120,7 @@ delete-vs-edit all land in the conflict row. In-place threads have no base;
 their whole manifest applies (v0.1 semantics), which is why isolation is the
 default on git repos.
 
-**Rebase** (`loom rebase`) walks base ∪ worktree ∪ repo per file:
+**Rebase** (`heddle rebase`) walks base ∪ worktree ∪ repo per file:
 
 - fabric-only changes (thread didn't touch `f`) **fast-forward** into the
   worktree — copies, and deletions when the fabric deleted `f`;
@@ -135,7 +135,7 @@ Then the base is re-snapshotted to the fabric's current state and the head
 stitch re-captured, so the next land measures purely against the new base. A
 Proposed thread returns to Active; any parked approval is handed back.
 
-**Hygiene.** `loom clean` removes worktrees of Woven threads only, and only
+**Hygiene.** `heddle clean` removes worktrees of Woven threads only, and only
 when every file in the base ∪ head manifests still matches the last capture
 — uncaptured divergence refuses with the file list. Live threads and orphans
 are never cleaned. (Files created in a worktree after its last stitch and
@@ -143,7 +143,7 @@ outside any manifest are undetectable here — a documented v1 limit.)
 
 ## Trust boundary
 
-Loom automates coordination, never consent. A stitch **only reads**. The
+Heddle automates coordination, never consent. A stitch **only reads**. The
 weave gate verifies **in a scratch copy**. Applying a green weave to the
 real tree is an *action*: it happens only past an explicit human yes,
 expressed through the `WeaveConsent` trait — the standalone binary asks y/N
@@ -151,7 +151,7 @@ at the terminal and refuses when stdin is not a terminal; the MCP server
 always refuses (its stdin is the protocol channel; no human is at it); an
 embedding host implements consent over its own approvals queue. "Auto-weave
 on green" would be an explicit, revocable grant, off by default, and is not
-implemented here. Cross-machine: `loom sync` shares metadata and scoped
+implemented here. Cross-machine: `heddle sync` shares metadata and scoped
 file blobs with the configured remote — the same exposure as pushing a
 branch there — and runs only when invoked (`--auto` is per-repo opt-in).
 Adoption claims decide races; they never move a live holder's work.
@@ -159,20 +159,20 @@ Adoption claims decide races; they never move a live holder's work.
 ## Multi-machine sync (shipped)
 
 Any git remote both machines can push to is the whole infrastructure. All
-loom traffic rides hidden refs — never branches, tags, or checkouts:
+heddle traffic rides hidden refs — never branches, tags, or checkouts:
 
 ```text
-refs/loom/<machine-id>/state    published state: commit tree of
+refs/heddle/<machine-id>/state    published state: commit tree of
                                   state.json        threads/leases/stitches
                                   objects/<sha256>  scoped file blobs
-refs/loom/fabric                THE shared fabric: fabric.json = ordered
+refs/heddle/fabric                THE shared fabric: fabric.json = ordered
                                 landed-weave entries, each carrying its
                                 apply manifest; blobs in objects/
-refs/loom/claims/<thread-id>    orphan-adoption claims
-refs/loom/<machine-id>/mail/*   opaque mailbox payloads
+refs/heddle/claims/<thread-id>    orphan-adoption claims
+refs/heddle/<machine-id>/mail/*   opaque mailbox payloads
 ```
 
-**Sync pass order:** (1) fetch `refs/loom/*` (pruned); (2) reconcile the
+**Sync pass order:** (1) fetch `refs/heddle/*` (pruned); (2) reconcile the
 fabric — if the shared list strictly extends the local one, materialize the
 new entries' blobs and replay their apply manifests onto the local tree; if
 the local list strictly extends the shared one, publish the missing entries
@@ -183,20 +183,20 @@ leases are cached read-only for `status`, cross-machine toe-steps computed
 against local live leases, adoptable orphans listed.
 
 **Fabric authority is a compare-and-swap ref push:** `git push
---force-with-lease=refs/loom/fabric:<sha-this-machine-last-fetched>`. The
+--force-with-lease=refs/heddle/fabric:<sha-this-machine-last-fetched>`. The
 push succeeds only if the remote still has that value — git's atomic ref
 update IS the shuttle token. A lost race degrades into the same honest flow
 as a local collision: fetch, "fabric moved", rebase, re-propose. **Claims**
 use the same primitive with expected-value "absent": the earliest push wins
 deterministically and the loser is told who won.
 
-**The mailbox** carries `kind` + opaque bytes that Loom never interprets or
+**The mailbox** carries `kind` + opaque bytes that Heddle never interprets or
 verifies — sign payloads yourself if you need authenticity. It exists so
 higher layers (an embedding host's team envelopes, consent dials) can ride
 the same remote without teaching this crate their formats.
 
 **Posture:** machine ids are identity, not authentication. Anyone who can
-push to the remote can write any loom ref — the trust model is exactly "who
+push to the remote can write any heddle ref — the trust model is exactly "who
 you give push access to", the same as branches. Signatures are the first
 federation work item below.
 
@@ -235,19 +235,19 @@ stays honest: federation must be additive.
 | `Fabric` | repo id, tip weave, ordered history |
 
 Storage is boring on purpose: JSON state + append-only JSONL events +
-content-addressed whole-file blobs under `~/.loom` (override `LOOM_DATA`),
+content-addressed whole-file blobs under `~/.heddle` (override `HEDDLE_DATA`),
 0o600, bounded, corrupt-line tolerant.
 
 ## Capture rules
 
 - Built-in excludes: `.git`, `target`, `node_modules` — any entry type
   (`.git` is a *file* inside a worktree). Never overridable.
-- `.loomignore` at the repo root extends them: one pattern per line in
-  Loom's glob grammar (`**`, `*`, `?`; a fully-literal line ignores that
+- `.heddleignore` at the repo root extends them: one pattern per line in
+  Heddle's glob grammar (`**`, `*`, `?`; a fully-literal line ignores that
   path and everything under it), `#` comments. It cannot re-include
   built-ins. Applies to capture and to the gate's scratch copy.
 - Files over 8 MiB are skipped and named in the stitch outcome
-  (`LOOM_MAX_FILE_MB` adjusts the cap, clamped 1–1024). Loom snapshots
+  (`HEDDLE_MAX_FILE_MB` adjusts the cap, clamped 1–1024). Heddle snapshots
   source, not artifacts.
 - Symlinks are never followed. Manifest paths are re-validated on every
   apply (relative, no `..`) — stored data never picks filesystem paths.
@@ -262,13 +262,13 @@ content-addressed whole-file blobs under `~/.loom` (override `LOOM_DATA`),
 - `sync.rs`: the multi-machine layer above — state refs, CAS fabric,
   claims, mailbox — implemented over the repo's own `git` binary; the
   engine never shells git itself.
-- `loom` CLI: `init · config · lease · stitch · propose · export · rebase ·
+- `heddle` CLI: `init · config · lease · stitch · propose · export · rebase ·
   withdraw · adopt · clean · sync · status · log · mcp`, with
   `--lease/--thread` overrides for multi-seat terminals.
-- `loom mcp`: stdio MCP server — `loom_status · loom_lease · loom_stitch ·
-  loom_propose · loom_rebase · loom_adopt`. Proposing verifies; landing
+- `heddle mcp`: stdio MCP server — `heddle_status · heddle_lease · heddle_stitch ·
+  heddle_propose · heddle_rebase · heddle_adopt`. Proposing verifies; landing
   always requires the human path.
 - **Not yet**, honestly: signatures; gossip without a blessed remote;
   rolling-hash chunking (whole-file snapshots dedup by sha256); per-slice
   test impact (verify is whole-repo); gitignore parsing beyond
-  `.loomignore`.
+  `.heddleignore`.

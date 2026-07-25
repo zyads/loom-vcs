@@ -1,24 +1,28 @@
-# Loom — version control for many hands moving at once.
+# Heddle — version control for many hands moving at once.
 # MIT license; see LICENSE. Standalone: deliberately tiny (serde for the
 # objects, sha2+hex for content addressing). The engine is synchronous — no
 # async runtime.
 #
-# The package is `loom-vcs` (crates.io `loom` belongs to tokio's concurrency
-# checker); the library and the installed binary are both still named `loom`.
+# Formerly published as `loom-vcs`; renamed to Heddle (the loom part that
+# keeps threads separated so they never tangle) to avoid collisions with
+# several unrelated Loom projects. Library and installed binary: `heddle`.
 [package]
-name = "loom-vcs"
+name = "heddle"
 version = "0.4.0"
 edition = "2021"
 license = "MIT"
-description = "Version control for many hands moving at once: per-task git worktrees, intent leases, a green-by-construction fabric with honest file-level merges, orphan adoption, and multi-machine sync over any git remote."
-repository = "https://github.com/zyads/loom-vcs"
+description = "Version control for many hands moving at once (formerly loom-vcs): per-task git worktrees, intent leases, a green-by-construction fabric with honest file-level merges, orphan adoption, and multi-machine sync over any git remote."
+repository = "https://github.com/zyads/heddle"
+readme = "README.md"
+keywords = ["ai-agents", "version-control", "mcp", "git", "agents"]
+categories = ["development-tools", "command-line-utilities"]
 
 [lib]
-name = "loom"
+name = "heddle"
 path = "src/lib.rs"
 
 [[bin]]
-name = "loom"
+name = "heddle"
 path = "src/main.rs"
 
 [dependencies]

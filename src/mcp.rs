@@ -1,7 +1,7 @@
-// Loom — version control for many hands moving at once.
+// Heddle — version control for many hands moving at once.
 // Copyright (c) 2026 Aether-OS contributors. MIT license; see LICENSE.
 
-//! `loom mcp` — a minimal MCP (Model Context Protocol) stdio server, so any
+//! `heddle mcp` — a minimal MCP (Model Context Protocol) stdio server, so any
 //! agent session (Claude Code or otherwise) can lease/stitch/propose without
 //! any other infrastructure.
 //!
@@ -10,10 +10,10 @@
 //! `tools/list`, `tools/call` — so ~200 lines beat an SDK dependency.
 //!
 //! **Honesty at the protocol edge:** this process's stdin is the protocol
-//! channel, so there is no terminal to ask a human at. `loom_propose`
+//! channel, so there is no terminal to ask a human at. `heddle_propose`
 //! therefore uses [`AutoDeny`]: the verify runs for real (scratch copy,
 //! never the working tree) and a green result is recorded, but the apply is
-//! always refused with instructions to run `loom propose` at a terminal.
+//! always refused with instructions to run `heddle propose` at a terminal.
 //! The tool descriptions say so, in those words — an agent reading them
 //! learns the truth, not a euphemism.
 
@@ -21,11 +21,11 @@ use std::io::{BufRead, Write};
 
 use serde_json::{json, Value};
 
-use loom::consent::{AutoDeny, WeaveDisposition};
-use loom::{solo, Loom};
+use heddle::consent::{AutoDeny, WeaveDisposition};
+use heddle::{solo, Heddle};
 
 /// Serve MCP over stdio until stdin closes.
-pub fn serve(engine: &Loom) {
+pub fn serve(engine: &Heddle) {
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
     for line in stdin.lock().lines() {
@@ -44,7 +44,7 @@ pub fn serve(engine: &Loom) {
             "initialize" => json!({"jsonrpc": "2.0", "id": id, "result": {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "loom", "version": env!("CARGO_PKG_VERSION")},
+                "serverInfo": {"name": "heddle", "version": env!("CARGO_PKG_VERSION")},
             }}),
             "ping" => json!({"jsonrpc": "2.0", "id": id, "result": {}}),
             "tools/list" => json!({"jsonrpc": "2.0", "id": id, "result": {"tools": tools()}}),
@@ -81,22 +81,22 @@ pub fn serve(engine: &Loom) {
 
 fn tools() -> Value {
     let repo_prop = json!({"type": "string", "description":
-        "Repo directory (default: the server's working directory). Must already be `loom init`-ed."});
+        "Repo directory (default: the server's working directory). Must already be `heddle init`-ed."});
     json!([
         {
-            "name": "loom_status",
+            "name": "heddle_status",
             "description": "Threads, live leases (with expiry), orphan queue, toe-step warnings and \
                 fabric history for the repo. Read-only.",
             "inputSchema": {"type": "object", "properties": {"repo": repo_prop}},
         },
         {
-            "name": "loom_lease",
+            "name": "heddle_lease",
             "description": "Declare an intent lease before editing: a one-sentence goal plus \
                 repo-relative path globs (e.g. src/parse/**). Overlap with live leases SUCCEEDS \
                 and returns toe_step warnings — a lease is knowledge, not a lock. On a git repo \
                 the thread gets its OWN isolated worktree: the response's working_dir is where \
                 you MUST cd and do ALL file edits (the repo tree itself changes only when your \
-                weave lands). Becomes the current lease for loom_stitch/loom_propose.",
+                weave lands). Becomes the current lease for heddle_stitch/heddle_propose.",
             "inputSchema": {"type": "object", "properties": {
                 "goal": {"type": "string", "description": "One sentence: what you are about to do."},
                 "scope": {"type": "array", "items": {"type": "string"},
@@ -112,7 +112,7 @@ fn tools() -> Value {
             }, "required": ["goal", "scope"]},
         },
         {
-            "name": "loom_stitch",
+            "name": "heddle_stitch",
             "description": "Checkpoint the leased scope from the thread's working_dir (its \
                 worktree when isolated): the server reads the files itself and snapshots them \
                 content-addressed, deletions included (you never upload content, and nothing is \
@@ -123,21 +123,21 @@ fn tools() -> Value {
             }},
         },
         {
-            "name": "loom_rebase",
+            "name": "heddle_rebase",
             "description": "After a land was refused with 'fabric moved under you': refresh the \
                 thread's worktree from the fabric. Fabric-only changes fast-forward in; files \
                 changed on BOTH sides keep YOUR version and come back as conflicts to review \
-                (the fabric's copy is in the repo tree). Then loom_stitch and loom_propose again.",
+                (the fabric's copy is in the repo tree). Then heddle_stitch and heddle_propose again.",
             "inputSchema": {"type": "object", "properties": {
                 "thread_id": {"type": "string", "description": "Defaults to the current thread."},
                 "repo": repo_prop,
             }},
         },
         {
-            "name": "loom_propose",
+            "name": "heddle_propose",
             "description": "Run the weave gate: the repo's verify command runs in a scratch copy, \
                 never the working tree. Red is reported with the log tail. Green is recorded, but \
-                landing it needs a human yes at a terminal (`loom propose`) — this server has no \
+                landing it needs a human yes at a terminal (`heddle propose`) — this server has no \
                 terminal, so the apply is always refused here and the thread returns to active, \
                 re-proposable. Honest summary: proposing verifies; it never lands.",
             "inputSchema": {"type": "object", "properties": {
@@ -146,7 +146,7 @@ fn tools() -> Value {
             }},
         },
         {
-            "name": "loom_adopt",
+            "name": "heddle_adopt",
             "description": "Take over an orphaned thread (its holder's lease expired — crashed \
                 session, dead machine). You inherit the SAME lease: goal, criteria and scope \
                 preserved, fresh TTL. Continue from its last stitch.",
@@ -162,10 +162,10 @@ fn arg<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
     args.get(key).and_then(|v| v.as_str()).filter(|s| !s.trim().is_empty())
 }
 
-fn repo_of(engine: &Loom, args: &Value) -> Result<loom::RepoConfig, String> {
+fn repo_of(engine: &Heddle, args: &Value) -> Result<heddle::RepoConfig, String> {
     let path = arg(args, "repo").unwrap_or(".");
     engine.repo_containing(path).ok_or_else(|| {
-        format!("no registered loom repo contains '{path}' — run `loom init` there first")
+        format!("no registered heddle repo contains '{path}' — run `heddle init` there first")
     })
 }
 
@@ -177,13 +177,13 @@ fn holder() -> String {
         .unwrap_or_else(|| "mcp agent".to_string())
 }
 
-fn call(engine: &Loom, name: &str, args: &Value) -> Result<String, String> {
+fn call(engine: &Heddle, name: &str, args: &Value) -> Result<String, String> {
     match name {
-        "loom_status" => {
+        "heddle_status" => {
             let repo = repo_of(engine, args)?;
             let snap = engine.snapshot();
             let rs = snap.repo_states.get(&repo.id).cloned().unwrap_or_default();
-            let now = loom_now();
+            let now = heddle_now();
             let leases: Vec<Value> = rs
                 .leases
                 .iter()
@@ -196,16 +196,16 @@ fn call(engine: &Loom, name: &str, args: &Value) -> Result<String, String> {
                 "threads": rs.threads,
                 "live_leases": leases,
                 "orphans": rs.threads.iter()
-                    .filter(|t| t.status == loom::ThreadStatus::Orphaned)
+                    .filter(|t| t.status == heddle::ThreadStatus::Orphaned)
                     .collect::<Vec<_>>(),
                 "toe_steps": rs.toe_steps.iter().rev().take(5).collect::<Vec<_>>(),
                 "note": "leases warn, never block; weaves land only past a human yes at a terminal",
             })
             .to_string())
         }
-        "loom_lease" => {
+        "heddle_lease" => {
             let repo = repo_of(engine, args)?;
-            let goal = arg(args, "goal").ok_or("loom_lease needs a goal")?;
+            let goal = arg(args, "goal").ok_or("heddle_lease needs a goal")?;
             let scope: Vec<String> = args
                 .get("scope")
                 .and_then(|s| s.as_array())
@@ -218,9 +218,9 @@ fn call(engine: &Loom, name: &str, args: &Value) -> Result<String, String> {
                 .unwrap_or_default();
             let ttl_ms = args.get("ttl_ms").and_then(|v| v.as_u64());
             let mode = if args.get("in_place").and_then(|v| v.as_bool()).unwrap_or(false) {
-                loom::IsolationMode::InPlace
+                heddle::IsolationMode::InPlace
             } else {
-                loom::IsolationMode::Auto
+                heddle::IsolationMode::Auto
             };
             let out = engine
                 .declare_lease_mode(&repo.id, &holder(), goal, scope, criteria, ttl_ms, mode)?;
@@ -247,12 +247,12 @@ fn call(engine: &Loom, name: &str, args: &Value) -> Result<String, String> {
             })
             .to_string())
         }
-        "loom_rebase" => {
+        "heddle_rebase" => {
             let repo = repo_of(engine, args)?;
             let thread_id = match arg(args, "thread_id") {
                 Some(t) => t.to_string(),
                 None => solo::get(&engine.base(), &repo.id)
-                    .ok_or("no current thread in this repo — loom_lease first")?
+                    .ok_or("no current thread in this repo — heddle_lease first")?
                     .thread_id,
             };
             let out = engine.rebase_thread(&thread_id)?;
@@ -261,25 +261,25 @@ fn call(engine: &Loom, name: &str, args: &Value) -> Result<String, String> {
                 "fast_forwarded": out.fast_forwarded,
                 "conflicts": out.conflicts,
                 "note": if out.conflicts.is_empty() {
-                    "rebased clean — loom_stitch, then loom_propose when ready".to_string()
+                    "rebased clean — heddle_stitch, then heddle_propose when ready".to_string()
                 } else {
                     format!(
                         "CONFLICTS on {} file(s): both the fabric and this thread changed \
                          them. Your version was kept in the worktree; the fabric's is in \
-                         the repo tree. Reconcile in the worktree, then loom_stitch and \
-                         loom_propose.",
+                         the repo tree. Reconcile in the worktree, then heddle_stitch and \
+                         heddle_propose.",
                         out.conflicts.len()
                     )
                 },
             })
             .to_string())
         }
-        "loom_stitch" => {
+        "heddle_stitch" => {
             let repo = repo_of(engine, args)?;
             let lease_id = match arg(args, "lease_id") {
                 Some(l) => l.to_string(),
                 None => solo::get(&engine.base(), &repo.id)
-                    .ok_or("no current lease in this repo — loom_lease first")?
+                    .ok_or("no current lease in this repo — heddle_lease first")?
                     .lease_id,
             };
             engine.heartbeat(&lease_id)?;
@@ -289,17 +289,17 @@ fn call(engine: &Loom, name: &str, args: &Value) -> Result<String, String> {
                 "unchanged": out.unchanged,
                 "files": out.stitch.files.len(),
                 "skipped": out.skipped,
-                "lease_expires_in_ms": out.lease.expires_in_ms(loom_now()),
+                "lease_expires_in_ms": out.lease.expires_in_ms(heddle_now()),
                 "auto_sync": autosync_note(engine, &repo),
             })
             .to_string())
         }
-        "loom_propose" => {
+        "heddle_propose" => {
             let repo = repo_of(engine, args)?;
             let thread_id = match arg(args, "thread_id") {
                 Some(t) => t.to_string(),
                 None => solo::get(&engine.base(), &repo.id)
-                    .ok_or("no current thread in this repo — loom_lease first")?
+                    .ok_or("no current thread in this repo — heddle_lease first")?
                     .thread_id,
             };
             match engine.propose_with_consent(&thread_id, &AutoDeny)? {
@@ -318,7 +318,7 @@ fn call(engine: &Loom, name: &str, args: &Value) -> Result<String, String> {
                     "reason": reason,
                     "auto_sync": autosync_note(engine, &repo),
                     "note": "verified green; NOTHING was applied — landing requires a human at a \
-                             terminal: run `loom propose` there (it re-runs the verify and asks)",
+                             terminal: run `heddle propose` there (it re-runs the verify and asks)",
                 })
                 .to_string()),
                 WeaveDisposition::Landed { .. } => {
@@ -326,8 +326,8 @@ fn call(engine: &Loom, name: &str, args: &Value) -> Result<String, String> {
                 }
             }
         }
-        "loom_adopt" => {
-            let thread_id = arg(args, "thread_id").ok_or("loom_adopt needs a thread_id")?;
+        "heddle_adopt" => {
+            let thread_id = arg(args, "thread_id").ok_or("heddle_adopt needs a thread_id")?;
             // Local first; unknown + a sync remote → the cross-machine
             // claims flow (first CAS push wins; losing names the winner).
             let (thread, lease) = match engine.adopt(thread_id, &holder()) {
@@ -335,7 +335,7 @@ fn call(engine: &Loom, name: &str, args: &Value) -> Result<String, String> {
                 Err(e) if e.contains("no thread with id") => {
                     let repo = repo_of(engine, args)?;
                     if repo.sync_remote.is_some() {
-                        loom::sync::adopt_remote(engine, &repo.id, thread_id, &holder())?
+                        heddle::sync::adopt_remote(engine, &repo.id, thread_id, &holder())?
                     } else {
                         return Err(e);
                     }
@@ -359,7 +359,7 @@ fn call(engine: &Loom, name: &str, args: &Value) -> Result<String, String> {
 
 /// Run the repo's opted-in auto-sync (a no-op without `--auto`) and shape
 /// an honest one-line summary; sync failures never fail the local call.
-fn autosync_note(engine: &Loom, repo: &loom::RepoConfig) -> Value {
+fn autosync_note(engine: &Heddle, repo: &heddle::RepoConfig) -> Value {
     // Re-read the config in case sync flags changed since `repo` was read.
     let repo = engine
         .snapshot()
@@ -367,7 +367,7 @@ fn autosync_note(engine: &Loom, repo: &loom::RepoConfig) -> Value {
         .into_iter()
         .find(|r| r.id == repo.id)
         .unwrap_or_else(|| repo.clone());
-    match loom::sync::maybe_autosync(engine, &repo) {
+    match heddle::sync::maybe_autosync(engine, &repo) {
         None => Value::Null,
         Some(Ok(out)) => json!({
             "remote": out.remote,
@@ -380,7 +380,7 @@ fn autosync_note(engine: &Loom, repo: &loom::RepoConfig) -> Value {
     }
 }
 
-fn loom_now() -> u64 {
+fn heddle_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)

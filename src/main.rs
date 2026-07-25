@@ -1,12 +1,12 @@
-// Loom — version control for many hands moving at once.
+// Heddle — version control for many hands moving at once.
 // Copyright (c) 2026 Aether-OS contributors. MIT license; see LICENSE.
 
-//! The standalone `loom` binary — solo/CLI front-end over the engine in
-//! `lib.rs`, plus `loom mcp`, a stdio MCP server for agent sessions.
+//! The standalone `heddle` binary — solo/CLI front-end over the engine in
+//! `lib.rs`, plus `heddle mcp`, a stdio MCP server for agent sessions.
 //!
 //! Verbs: `init · config · lease · stitch · propose · export · withdraw ·
-//! adopt · status · log · mcp`. State lives under `~/.loom` (override with
-//! `LOOM_DATA`).
+//! adopt · status · log · mcp`. State lives under `~/.heddle` (override with
+//! `HEDDLE_DATA`).
 //! The current lease per repo is remembered in a solo-mode pointer
 //! (`solo.json`) so `stitch`/`propose`/`withdraw` need no ids.
 //!
@@ -17,47 +17,47 @@
 
 use std::process::ExitCode;
 
-use loom::consent::{TerminalConsent, WeaveDisposition};
-use loom::{solo, store, sync, IsolationMode, Loom, RepoConfig, ThreadStatus};
+use heddle::consent::{TerminalConsent, WeaveDisposition};
+use heddle::{solo, store, sync, IsolationMode, Heddle, RepoConfig, ThreadStatus};
 
 mod mcp;
 
 const USAGE: &str = "\
-loom — version control for many hands moving at once (docs/DESIGN.md)
+heddle — version control for many hands moving at once (docs/DESIGN.md)
 
 usage:
-  loom init [--verify CMD] [--git-bridge]     register the current directory
+  heddle init [--verify CMD] [--git-bridge]     register the current directory
        [--bridge-mode squash|stitches|both]   (bridge granularity; default
                                               squash — one commit per weave)
-  loom config [--bridge-mode MODE]            show this repo's config, or set
+  heddle config [--bridge-mode MODE]            show this repo's config, or set
                                               the git-bridge granularity
-  loom lease \"<goal>\" <scope...>              declare an intent lease; on a git
+  heddle lease \"<goal>\" <scope...>              declare an intent lease; on a git
        [--criteria TEXT]... [--ttl-ms N]      repo the thread gets its OWN
        [--isolated | --in-place]              worktree — edit there
-  loom stitch [--lease ID]                    checkpoint the leased scope
-  loom propose [--thread ID]                  verify in a scratch copy; green
+  heddle stitch [--lease ID]                    checkpoint the leased scope
+  heddle propose [--thread ID]                  verify in a scratch copy; green
                                               asks you before applying
-  loom export [--thread ID]                   write the thread's stitch chain to
-                                              its draft branch loom/<id>-<goal>
+  heddle export [--thread ID]                   write the thread's stitch chain to
+                                              its draft branch heddle/<id>-<goal>
                                               for review — nothing lands
-  loom rebase [--thread ID]                   refresh the thread's worktree from
+  heddle rebase [--thread ID]                   refresh the thread's worktree from
                                               the fabric (after \"fabric moved\")
-  loom withdraw                               return a proposed thread to active
-  loom adopt <thread-id>                      take over an orphaned thread
+  heddle withdraw                               return a proposed thread to active
+  heddle adopt <thread-id>                      take over an orphaned thread
                                               (local, or a synced peer's)
-  loom clean                                  remove worktrees of woven threads
+  heddle clean                                  remove worktrees of woven threads
                                               (refuses uncaptured divergence)
-  loom sync [--remote NAME] [--auto on|off]   sync leases/threads/fabric with a
+  heddle sync [--remote NAME] [--auto on|off]   sync leases/threads/fabric with a
                                               git remote (shares scoped content
                                               there — same exposure as a push)
-  loom status                                 threads, leases, orphans, peers
-  loom log                                    fabric history + recent events
-  loom mcp                                    stdio MCP server (loom_status,
-                                              loom_lease, loom_stitch,
-                                              loom_propose, loom_rebase,
-                                              loom_adopt)
+  heddle status                                 threads, leases, orphans, peers
+  heddle log                                    fabric history + recent events
+  heddle mcp                                    stdio MCP server (heddle_status,
+                                              heddle_lease, heddle_stitch,
+                                              heddle_propose, heddle_rebase,
+                                              heddle_adopt)
 
-state: ~/.loom (override with LOOM_DATA)";
+state: ~/.heddle (override with HEDDLE_DATA)";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -90,7 +90,7 @@ fn main() -> ExitCode {
     match out {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("loom: {e}");
+            eprintln!("heddle: {e}");
             ExitCode::FAILURE
         }
     }
@@ -105,18 +105,18 @@ fn holder() -> String {
 }
 
 /// The registered repo containing the current directory.
-fn current_repo(engine: &Loom) -> Result<RepoConfig, String> {
+fn current_repo(engine: &Heddle) -> Result<RepoConfig, String> {
     engine.repo_containing(".").ok_or_else(|| {
-        "no registered repo contains this directory — run `loom init` here first".to_string()
+        "no registered repo contains this directory — run `heddle init` here first".to_string()
     })
 }
 
 /// The solo pointer for the current repo, validated against the engine.
-fn current_pointer(engine: &Loom) -> Result<(RepoConfig, solo::SoloPointer), String> {
+fn current_pointer(engine: &Heddle) -> Result<(RepoConfig, solo::SoloPointer), String> {
     let repo = current_repo(engine)?;
     let ptr = solo::get(&engine.base(), &repo.id).ok_or_else(|| {
-        "no current lease in this repo — `loom lease \"<goal>\" <scope...>` first \
-         (or `loom adopt <thread-id>`)"
+        "no current lease in this repo — `heddle lease \"<goal>\" <scope...>` first \
+         (or `heddle adopt <thread-id>`)"
             .to_string()
     })?;
     Ok((repo, ptr))
@@ -141,7 +141,7 @@ fn flag_value(rest: &[String], flag: &str) -> Result<Option<String>, String> {
 /// Resolve which lease+thread a verb addresses: explicit flags win, the
 /// solo pointer covers the everyday single-seat case.
 fn target(
-    engine: &Loom,
+    engine: &Heddle,
     rest: &[String],
 ) -> Result<(RepoConfig, String /*lease*/, String /*thread*/), String> {
     let lease_flag = flag_value(rest, "--lease")?;
@@ -192,7 +192,7 @@ fn cmd_init(rest: &[String]) -> Result<(), String> {
                 let v = it
                     .next()
                     .ok_or_else(|| "--bridge-mode needs squash | stitches | both".to_string())?;
-                bridge_mode = Some(v.parse::<loom::BridgeMode>()?);
+                bridge_mode = Some(v.parse::<heddle::BridgeMode>()?);
             }
             other => return Err(format!("unknown init flag '{other}'")),
         }
@@ -218,16 +218,16 @@ fn bridge_line(repo: &RepoConfig) -> String {
         );
     }
     match repo.bridge_mode {
-        loom::BridgeMode::Squash => {
+        heddle::BridgeMode::Squash => {
             "on, squash — one local commit per landed weave (never a push)".into()
         }
-        loom::BridgeMode::Stitches => {
-            "on, stitches — checkpoint commits on a loom/<thread> branch, \
+        heddle::BridgeMode::Stitches => {
+            "on, stitches — checkpoint commits on a heddle/<thread> branch, \
              merged with the weave message (never a push)"
                 .into()
         }
-        loom::BridgeMode::Both => {
-            "on, both — squash commit + the loom/<thread> branch kept \
+        heddle::BridgeMode::Both => {
+            "on, both — squash commit + the heddle/<thread> branch kept \
              unmerged (never a push)"
                 .into()
         }
@@ -243,7 +243,7 @@ fn cmd_config(rest: &[String]) -> Result<(), String> {
                 let v = it
                     .next()
                     .ok_or_else(|| "--bridge-mode needs squash | stitches | both".to_string())?;
-                bridge_mode = Some(v.parse::<loom::BridgeMode>()?);
+                bridge_mode = Some(v.parse::<heddle::BridgeMode>()?);
             }
             other => return Err(format!("unknown config flag '{other}'")),
         }
@@ -274,7 +274,7 @@ fn cmd_export(rest: &[String]) -> Result<(), String> {
     let thread_id = match flag_value(rest, "--thread")? {
         Some(id) => id,
         None => current_pointer(engine).map(|(_, ptr)| ptr.thread_id).map_err(|_| {
-            "no current thread — `loom export --thread <id>` (see `loom status`)".to_string()
+            "no current thread — `heddle export --thread <id>` (see `heddle status`)".to_string()
         })?,
     };
     let _ = repo;
@@ -314,7 +314,7 @@ fn cmd_lease(rest: &[String]) -> Result<(), String> {
         }
     }
     let goal = goal.ok_or_else(|| {
-        "usage: loom lease \"<goal>\" <scope...> [--criteria TEXT]... [--ttl-ms N] \
+        "usage: heddle lease \"<goal>\" <scope...> [--criteria TEXT]... [--ttl-ms N] \
          [--isolated|--in-place]"
             .to_string()
     })?;
@@ -357,7 +357,7 @@ fn cmd_lease(rest: &[String]) -> Result<(), String> {
 
 /// Fire an auto-sync pass when the repo opted in; print, never fail the
 /// local operation.
-fn autosync(engine: &Loom, repo: &RepoConfig) {
+fn autosync(engine: &Heddle, repo: &RepoConfig) {
     // Re-read the repo config: sync flags may have just changed.
     let repo = engine
         .snapshot()
@@ -400,7 +400,7 @@ fn print_sync(out: &sync::SyncOutcome, brief: bool) {
         );
     }
     for (tid, goal, machine) in &out.remote_orphans {
-        println!("  adoptable on {machine}: {tid} — {goal} (loom adopt {tid})");
+        println!("  adoptable on {machine}: {tid} — {goal} (heddle adopt {tid})");
     }
 }
 
@@ -432,7 +432,7 @@ fn cmd_sync(rest: &[String]) -> Result<(), String> {
     let repo = current_repo(engine)?;
     if remote.is_some() || auto.is_some() {
         println!(
-            "note: sync shares this repo's loom metadata AND scoped file content with the \
+            "note: sync shares this repo's heddle metadata AND scoped file content with the \
              remote — the same exposure as pushing a branch there."
         );
     }
@@ -463,9 +463,9 @@ fn cmd_rebase(rest: &[String]) -> Result<(), String> {
         for f in &out.conflicts {
             println!("    {f} (your version kept in the worktree; the fabric's is in the repo tree)");
         }
-        println!("  review those files, then `loom stitch` and `loom propose`.");
+        println!("  review those files, then `heddle stitch` and `heddle propose`.");
     } else {
-        println!("rebased clean — `loom propose` when ready");
+        println!("rebased clean — `heddle propose` when ready");
     }
     Ok(())
 }
@@ -499,7 +499,7 @@ fn cmd_stitch(rest: &[String]) -> Result<(), String> {
             out.stitch.id
         );
     } else {
-        let dels = out.stitch.files.values().filter(|h| *h == loom::TOMBSTONE).count();
+        let dels = out.stitch.files.values().filter(|h| *h == heddle::TOMBSTONE).count();
         if dels > 0 {
             println!(
                 "stitch {} ({} files, {} deletion(s))",
@@ -577,7 +577,7 @@ fn cmd_withdraw() -> Result<(), String> {
 fn cmd_adopt(rest: &[String]) -> Result<(), String> {
     let thread_id = rest
         .first()
-        .ok_or_else(|| "usage: loom adopt <thread-id> (see `loom status` for orphans)".to_string())?;
+        .ok_or_else(|| "usage: heddle adopt <thread-id> (see `heddle status` for orphans)".to_string())?;
     let engine = store();
     // Local first; unknown thread + a sync remote → try the claims flow.
     let (thread, lease) = match engine.adopt(thread_id, &holder()) {
@@ -605,7 +605,7 @@ fn cmd_adopt(rest: &[String]) -> Result<(), String> {
         println!("           (the thread's worktree, last stitch materialized — continue there)");
         println!();
     }
-    println!("  continue from the last stitch; `loom stitch` and `loom propose` as usual");
+    println!("  continue from the last stitch; `heddle stitch` and `heddle propose` as usual");
     Ok(())
 }
 
@@ -670,7 +670,7 @@ fn cmd_status() -> Result<(), String> {
         }
     }
     if rs.threads.is_empty() {
-        println!("    (none — `loom lease \"<goal>\" <scope...>` to start)");
+        println!("    (none — `heddle lease \"<goal>\" <scope...>` to start)");
     }
     let orphans: Vec<_> = rs
         .threads
@@ -678,7 +678,7 @@ fn cmd_status() -> Result<(), String> {
         .filter(|t| t.status == ThreadStatus::Orphaned)
         .collect();
     if !orphans.is_empty() {
-        println!("  orphans (adoptable — `loom adopt <thread-id>`):");
+        println!("  orphans (adoptable — `heddle adopt <thread-id>`):");
         for t in orphans {
             println!("    {} — {}", t.id, t.goal);
         }
@@ -690,7 +690,7 @@ fn cmd_status() -> Result<(), String> {
         );
     }
     if !rs.peers.is_empty() {
-        println!("  peers (as of last `loom sync`):");
+        println!("  peers (as of last `heddle sync`):");
         let now = wall_ms();
         for p in &rs.peers {
             let age_s = now.saturating_sub(p.fetched_ms) / 1000;
@@ -709,7 +709,7 @@ fn cmd_status() -> Result<(), String> {
                     t.id,
                     t.status,
                     t.goal,
-                    if adoptable { "  ← adoptable (loom adopt)" } else { "" }
+                    if adoptable { "  ← adoptable (heddle adopt)" } else { "" }
                 );
             }
         }
@@ -744,7 +744,7 @@ fn cmd_log() -> Result<(), String> {
         }
     }
     println!("recent events:");
-    for e in loom::store::read_events(&engine.base(), &repo.id, 15) {
+    for e in heddle::store::read_events(&engine.base(), &repo.id, 15) {
         println!(
             "  {} {}",
             e.get("kind").and_then(|k| k.as_str()).unwrap_or("?"),

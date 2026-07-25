@@ -1,12 +1,12 @@
-// Loom — version control for many hands moving at once.
+// Heddle — version control for many hands moving at once.
 // Copyright (c) 2026 Aether-OS contributors. MIT license; see LICENSE.
 
-//! **Loom** — version control for many hands moving at once (see
+//! **Heddle** — version control for many hands moving at once (see
 //! `docs/DESIGN.md` for the full design).
 //!
 //! Git detects collisions at merge time, hours after the toes were stepped
 //! on; leaves crashed agents' work as unowned dirty worktrees; and makes
-//! "green main" a snapshot, not an invariant. Loom is the coordination
+//! "green main" a snapshot, not an invariant. Heddle is the coordination
 //! layer that sits above git: each task runs in its **own git worktree**
 //! (isolation — two threads physically cannot clobber each other), declares
 //! an **intent lease** before touching files (coordination — collisions
@@ -18,7 +18,7 @@
 //! under you — rebase" instead of overwriting either side. Crashed work
 //! becomes an adoptable **orphan**, never a mess. The [`sync`] module
 //! extends all of it across machines over any shared git remote: state
-//! rides hidden `refs/loom/*` refs, and fabric authority is a
+//! rides hidden `refs/heddle/*` refs, and fabric authority is a
 //! compare-and-swap ref push — git's atomic ref update is the shuttle
 //! token.
 //!
@@ -27,9 +27,9 @@
 //! * **A lease is knowledge, not a lock.** Declaring a scope that overlaps a
 //!   live lease SUCCEEDS — the collision is surfaced the moment it is cheap,
 //!   as a recorded `toe_step` warning carrying both goals and a suggested
-//!   split. Nothing in Loom ever blocks an agent from working.
+//!   split. Nothing in Heddle ever blocks an agent from working.
 //! * **A thread edits its own worktree, not the repo.** Isolated threads
-//!   (the default on git repos) get a detached worktree under the loom data
+//!   (the default on git repos) get a detached worktree under the heddle data
 //!   dir; the repo tree changes only when a weave lands, through the merge
 //!   rules above. In-place mode (`--in-place`, or a non-git repo) keeps the
 //!   old direct-edit behavior, honestly labeled.
@@ -52,9 +52,9 @@
 //!   the repo's configured granularity ([`BridgeMode`]): `squash` (one
 //!   commit per weave — the default), `stitches` (checkpoint commits on a
 //!   per-thread branch, merged with the weave message), or `both` (squash
-//!   plus the branch kept unmerged). `loom export` writes an unlanded
+//!   plus the branch kept unmerged). `heddle export` writes an unlanded
 //!   thread's stitch chain to its per-thread branch for human review.
-//! * **Sync is explicit and says what it shares.** `loom sync` publishes
+//! * **Sync is explicit and says what it shares.** `heddle sync` publishes
 //!   lease/thread metadata AND scoped file blobs to the configured remote —
 //!   the same exposure as pushing a branch there; `--auto` is a per-repo
 //!   opt-in. Objects are unsigned in this version (machine ids are
@@ -62,8 +62,8 @@
 //!   default without a format break.
 //!
 //! Storage is "boring on purpose": a JSON state file plus an append-only
-//! JSONL event log per repo under `<data dir>/<repo_id>/` (default `~/.loom`,
-//! overridable via the `LOOM_DATA` env var or [`Loom::at`]), 0o600, bounded,
+//! JSONL event log per repo under `<data dir>/<repo_id>/` (default `~/.heddle`,
+//! overridable via the `HEDDLE_DATA` env var or [`Heddle::at`]), 0o600, bounded,
 //! corrupt-line tolerant, and a content-addressed blob store (whole files
 //! keyed by sha256; rolling-hash chunking is future work).
 
@@ -133,7 +133,7 @@ pub enum BridgeMode {
     #[default]
     Squash,
     /// Replay the thread's stitch chain as individual commits on a
-    /// per-thread branch `loom/<thread-id-short>-<goal-slug>`, then merge
+    /// per-thread branch `heddle/<thread-id-short>-<goal-slug>`, then merge
     /// that branch into the current branch with a merge commit carrying the
     /// weave message. History shows every checkpoint AND the semantic
     /// landing.
@@ -167,7 +167,7 @@ impl std::str::FromStr for BridgeMode {
     }
 }
 
-/// A registered loom repo: a directory the operator pointed Loom at.
+/// A registered heddle repo: a directory the operator pointed Heddle at.
 /// `id` is a stable hash of the canonical path, so re-registering the same
 /// directory is idempotent.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -185,11 +185,11 @@ pub struct RepoConfig {
     #[serde(default)]
     pub bridge_mode: BridgeMode,
     pub registered_ms: u64,
-    /// The git remote `loom sync` talks to, remembered from the first
-    /// `loom sync --remote <name>`. `None` = this repo has never synced.
+    /// The git remote `heddle sync` talks to, remembered from the first
+    /// `heddle sync --remote <name>`. `None` = this repo has never synced.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sync_remote: Option<String>,
-    /// When true (explicit opt-in: `loom sync --auto`), stitch and propose
+    /// When true (explicit opt-in: `heddle sync --auto`), stitch and propose
     /// also sync — sharing lease/thread metadata AND scoped file blobs with
     /// the remote, the same exposure as pushing a branch there.
     #[serde(default)]
@@ -285,7 +285,7 @@ pub struct Thread {
     /// standalone binary's consent is synchronous and never sets it). Hosts
     /// whose approvals live in memory only — where a restart or timeout kills
     /// them — leave a Proposed thread stuck when its `approval_id` is no
-    /// longer pending; [`Loom::reconcile_parked`] returns it to Active.
+    /// longer pending; [`Heddle::reconcile_parked`] returns it to Active.
     /// `None` on a Proposed thread means no approval is waiting (denied /
     /// withdrawn / mid-gate).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -341,13 +341,13 @@ pub struct Weave {
     pub verify: VerifyOutcome,
     pub ts_ms: u64,
     /// Exactly what landing applied to the tree (path → content hash or
-    /// [`TOMBSTONE`]). Empty until the weave lands. This is what `loom sync`
+    /// [`TOMBSTONE`]). Empty until the weave lands. This is what `heddle sync`
     /// publishes so other machines can replay the same change.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub applied: BTreeMap<String, String>,
 }
 
-/// The shared line. `tip` advances only in [`Loom::land_weave`], whose
+/// The shared line. `tip` advances only in [`Heddle::land_weave`], whose
 /// precondition is a green verify plus an explicit human yes — green by
 /// construction, honestly scoped: v1 verifies whole-repo state, not slices.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -382,7 +382,7 @@ pub struct ToeStep {
 // ---------------------------------------------------------------------------
 
 /// What one peer machine last published about this repo, cached locally by
-/// `loom sync` so `loom status` can show the whole team without touching
+/// `heddle sync` so `heddle status` can show the whole team without touching
 /// the network. Peers' threads and leases stay in THEIR state — this is a
 /// read-only view, refreshed on every sync; cross-machine orphans import
 /// into local state only through the claims flow in [`sync`].
@@ -400,7 +400,7 @@ pub struct PeerSnapshot {
     pub leases: Vec<Lease>,
 }
 
-/// Everything Loom knows about one repo. Persisted as
+/// Everything Heddle knows about one repo. Persisted as
 /// `<data dir>/<repo_id>/state.json`; every mutation also appends to the
 /// repo's `log.jsonl`.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -425,42 +425,69 @@ pub struct RepoState {
 
 /// The whole in-memory picture: the repo registry plus per-repo state.
 #[derive(Clone, Debug, Default)]
-pub struct LoomState {
+pub struct HeddleState {
     pub repos: Vec<RepoConfig>,
     pub repo_states: std::collections::HashMap<String, RepoState>,
 }
 
 /// The engine. One per process (see [`store`]); tests and embedders build
-/// isolated ones with [`Loom::at`]. The std Mutex guards are never held
+/// isolated ones with [`Heddle::at`]. The std Mutex guards are never held
 /// across an await — long work (file walks, verify runs) happens between
 /// locked phases.
-pub struct Loom {
+pub struct Heddle {
     base_override: Option<PathBuf>,
-    inner: Mutex<Option<LoomState>>,
+    inner: Mutex<Option<HeddleState>>,
 }
 
-/// The process-wide engine, rooted at the default data dir (`LOOM_DATA` env
-/// var when set, else `~/.loom` — resolved fresh on every touch).
-pub fn store() -> &'static Loom {
-    static S: std::sync::OnceLock<Loom> = std::sync::OnceLock::new();
-    S.get_or_init(|| Loom {
+/// The process-wide engine, rooted at the default data dir (`HEDDLE_DATA` env
+/// var when set, else `~/.heddle` — resolved fresh on every touch).
+pub fn store() -> &'static Heddle {
+    static S: std::sync::OnceLock<Heddle> = std::sync::OnceLock::new();
+    S.get_or_init(|| Heddle {
         base_override: None,
         inner: Mutex::new(None),
     })
 }
 
-/// The default storage root: `$LOOM_DATA` when set and non-empty, else
-/// `~/.loom` (via `$HOME`; falls back to `.loom` in the current directory
+/// The default storage root: `$HEDDLE_DATA` when set and non-empty (the
+/// pre-rename `$LOOM_DATA` is honored as a silent fallback), else
+/// `~/.heddle` (via `$HOME`; falls back to `.heddle` in the current directory
 /// when even `HOME` is unset).
+///
+/// Rename compatibility: when `~/.heddle` does not exist but a pre-rename
+/// `~/.loom` does, the existing `~/.loom` is used — with a one-line notice
+/// on stderr, once per process. Data is never moved silently; migrate by
+/// renaming the directory yourself (`mv ~/.loom ~/.heddle`).
 pub fn default_data_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("HEDDLE_DATA") {
+        if !dir.trim().is_empty() {
+            return PathBuf::from(dir);
+        }
+    }
+    // Silent fallback for the pre-rename env var (formerly loom-vcs).
     if let Ok(dir) = std::env::var("LOOM_DATA") {
         if !dir.trim().is_empty() {
             return PathBuf::from(dir);
         }
     }
     match std::env::var("HOME") {
-        Ok(home) if !home.trim().is_empty() => PathBuf::from(home).join(".loom"),
-        _ => PathBuf::from(".loom"),
+        Ok(home) if !home.trim().is_empty() => {
+            let home = PathBuf::from(home);
+            let new = home.join(".heddle");
+            let old = home.join(".loom");
+            if !new.exists() && old.exists() {
+                static NOTICE: std::sync::Once = std::sync::Once::new();
+                NOTICE.call_once(|| {
+                    eprintln!(
+                        "heddle: using existing ~/.loom data dir (pre-rename); \
+                         `mv ~/.loom ~/.heddle` to migrate"
+                    );
+                });
+                return old;
+            }
+            new
+        }
+        _ => PathBuf::from(".heddle"),
     }
 }
 
@@ -559,18 +586,18 @@ pub struct ExportOutcome {
     pub commits: usize,
 }
 
-impl Loom {
+impl Heddle {
     /// An isolated engine rooted at `base` — tests, and embedders that
     /// manage their own storage root; everyone else uses [`store`].
     pub fn at(base: PathBuf) -> Self {
-        Loom {
+        Heddle {
             base_override: Some(base),
             inner: Mutex::new(None),
         }
     }
 
-    /// Storage root: the override when constructed with [`Loom::at`], else
-    /// [`default_data_dir`] resolved fresh each call (so `LOOM_DATA` can be
+    /// Storage root: the override when constructed with [`Heddle::at`], else
+    /// [`default_data_dir`] resolved fresh each call (so `HEDDLE_DATA` can be
     /// pointed elsewhere by a test rig between calls).
     pub fn base(&self) -> PathBuf {
         self.base_override.clone().unwrap_or_else(default_data_dir)
@@ -579,9 +606,9 @@ impl Loom {
     /// Run `f` against the live state, loading on first touch and persisting
     /// whatever it changed. Guards never cross an await; anything slow
     /// (file walks, verify commands) runs OUTSIDE this closure.
-    fn with<T>(&self, f: impl FnOnce(&mut LoomState, &PathBuf) -> T) -> T {
+    fn with<T>(&self, f: impl FnOnce(&mut HeddleState, &PathBuf) -> T) -> T {
         let base = self.base();
-        let mut guard = self.inner.lock().expect("loom store lock poisoned");
+        let mut guard = self.inner.lock().expect("heddle store lock poisoned");
         if guard.is_none() {
             *guard = Some(store::load(&base));
         }
@@ -594,12 +621,12 @@ impl Loom {
 
     /// Drop cached state (tests, and after the path env changes).
     pub fn reset_cache(&self) {
-        *self.inner.lock().expect("loom store lock poisoned") = None;
+        *self.inner.lock().expect("heddle store lock poisoned") = None;
     }
 
     // -- repo registration --------------------------------------------------
 
-    /// Register a directory as a loom repo. Idempotent per canonical path:
+    /// Register a directory as a heddle repo. Idempotent per canonical path:
     /// re-registering updates `verify_cmd`/`git_bridge` in place and keeps
     /// the same `repo_id` (a stable hash of the canonical path).
     pub fn register_repo(
@@ -655,7 +682,7 @@ impl Loom {
     }
 
     /// Set how the git bridge projects landed weaves into git history
-    /// (`loom init --bridge-mode <mode>` / `loom config --bridge-mode
+    /// (`heddle init --bridge-mode <mode>` / `heddle config --bridge-mode
     /// <mode>`). Re-registering a repo keeps the stored mode.
     pub fn set_bridge_mode(&self, repo_id: &str, mode: BridgeMode) -> Result<RepoConfig, String> {
         self.with(|s, base| {
@@ -678,7 +705,7 @@ impl Loom {
     }
 
     /// Remember this repo's sync remote and auto-sync opt-in (set by
-    /// `loom sync --remote <name>` / `--auto`). Auto-sync is explicit
+    /// `heddle sync --remote <name>` / `--auto`). Auto-sync is explicit
     /// consent to share lease/thread metadata AND scoped file blobs with
     /// that remote on every stitch/propose — the same exposure as pushing a
     /// branch there.
@@ -739,7 +766,7 @@ impl Loom {
     ///
     /// Isolation is [`IsolationMode::Auto`]: when the repo is a git repo the
     /// thread gets its own worktree (edit THERE — `working_dir` on the
-    /// outcome); otherwise it works in place. Use [`Loom::declare_lease_mode`]
+    /// outcome); otherwise it works in place. Use [`Heddle::declare_lease_mode`]
     /// to pick explicitly.
     pub fn declare_lease(
         &self,
@@ -753,7 +780,7 @@ impl Loom {
         self.declare_lease_mode(repo_id, holder, goal, scope, criteria, ttl_ms, IsolationMode::Auto)
     }
 
-    /// [`Loom::declare_lease`] with the isolation mode explicit. Blocking
+    /// [`Heddle::declare_lease`] with the isolation mode explicit. Blocking
     /// when isolation applies (a `git worktree add` plus a scope walk to
     /// snapshot the thread's base); call from a blocking-task helper on
     /// async paths.
@@ -1050,7 +1077,7 @@ impl Loom {
             let root = thread.working_dir(&repo.path).to_string();
             if thread.worktree.is_some() && !std::path::Path::new(&root).is_dir() {
                 return Err(format!(
-                    "thread {}'s worktree is missing ({root}) — it was removed outside loom; \
+                    "thread {}'s worktree is missing ({root}) — it was removed outside heddle; \
                      re-lease to start a fresh one",
                     thread.id
                 ));
@@ -1295,7 +1322,7 @@ impl Loom {
     /// scratch copy of the repo, run the repo's verify command there, and
     /// record the outcome as a [`Weave`]. Green flips the thread to
     /// Proposed; red keeps it Active with the failure noted. NOTHING here
-    /// touches the real working tree — landing is [`Loom::land_weave`],
+    /// touches the real working tree — landing is [`Heddle::land_weave`],
     /// which callers gate behind [`consent::WeaveConsent`] (or a parked
     /// approval, when embedded in a host with an approvals queue).
     ///
@@ -1485,7 +1512,7 @@ impl Loom {
             if !conflicts.is_empty() {
                 let list = cap(&conflicts.join(", "), MAX_GOAL_CHARS);
                 let note = format!(
-                    "fabric moved under you on {list} — `loom rebase`, then re-propose"
+                    "fabric moved under you on {list} — `heddle rebase`, then re-propose"
                 );
                 if let Some(t) = rs.threads.iter_mut().find(|t| t.id == weave.thread_id) {
                     t.note = note.clone();
@@ -1500,7 +1527,7 @@ impl Loom {
                 );
                 return Err(format!(
                     "fabric moved under you on {list} — rebase the thread \
-                     (`loom rebase`) and re-propose"
+                     (`heddle rebase`) and re-propose"
                 ));
             }
             let objects = store::objects_dir(base, &repo_id);
@@ -1556,7 +1583,7 @@ impl Loom {
 
     /// Record an operator Deny: the thread stays Proposed (its green verify
     /// still stands) with the denial noted, and the parked approval no longer
-    /// gates it (`approval_id` clears — the recoverable state [`Loom::withdraw`]
+    /// gates it (`approval_id` clears — the recoverable state [`Heddle::withdraw`]
     /// resolves). A thread that already moved on (withdrawn to Active before
     /// the deny landed) is left untouched — the deny arrived late and lost.
     pub fn deny_weave(&self, weave_id: &str, note: &str) -> Result<(), String> {
@@ -1598,7 +1625,7 @@ impl Loom {
     /// embedding host's consent layer right after it parks one — the engine
     /// itself never talks to any approvals registry, and the standalone
     /// binary (whose consent is synchronous) never calls this. This is what
-    /// makes a lapsed approval *detectable*: see [`Loom::reconcile_parked`].
+    /// makes a lapsed approval *detectable*: see [`Heddle::reconcile_parked`].
     pub fn mark_parked(&self, thread_id: &str, approval_id: &str) -> Result<(), String> {
         self.with(|s, base| {
             let repo_id = find_repo_of_thread(s, thread_id)
@@ -2004,7 +2031,7 @@ impl Loom {
     /// ready to re-propose.
     /// Threads with no recorded approval id are left alone — they are either
     /// mid-gate (verify running / park in flight) or already denied, and the
-    /// manual [`Loom::withdraw`] covers those.
+    /// manual [`Heddle::withdraw`] covers those.
     pub fn reconcile_parked(&self, pending: &std::collections::HashSet<String>) {
         let now = now_ms();
         self.with(|s, base| {
@@ -2158,7 +2185,7 @@ impl Loom {
 
     /// Import a thread claimed from another machine (the sync module won its
     /// claim CAS first): thread + lease + stitches enter local state, the
-    /// thread lands as Orphaned so the normal [`Loom::adopt`] flow — fresh
+    /// thread lands as Orphaned so the normal [`Heddle::adopt`] flow — fresh
     /// worktree, head stitch materialized — takes it from there. Blobs for
     /// the stitch manifests must already be in the local object store.
     pub fn import_thread(
@@ -2208,7 +2235,7 @@ impl Loom {
 
     /// A full clone of the registry + per-repo state, for callers to shape
     /// into output. Reconciles orphans first, so what you see is true.
-    pub fn snapshot(&self) -> LoomState {
+    pub fn snapshot(&self) -> HeddleState {
         let now = now_ms();
         self.with(|s, base| {
             let ids: Vec<String> = s.repos.iter().map(|r| r.id.clone()).collect();
@@ -2278,7 +2305,7 @@ impl Loom {
     // -- draft-branch export -------------------------------------------------
 
     /// Write a thread's stitch chain to its per-thread git branch
-    /// (`loom/<thread-id-short>-<goal-slug>`) WITHOUT landing anything —
+    /// (`heddle/<thread-id-short>-<goal-slug>`) WITHOUT landing anything —
     /// draft-branch export for human review of in-flight (Active/Proposed)
     /// work; woven and orphaned threads export too, for archaeology.
     /// Rebuilds the branch from the current branch tip on every call —
@@ -2364,7 +2391,7 @@ impl Loom {
 
 /// Expire leases past TTL and orphan their live threads. Runs inside the
 /// store lock; appends an `orphaned` log line per flip.
-fn reconcile_repo(s: &mut LoomState, repo_id: &str, now: u64, base: &PathBuf) {
+fn reconcile_repo(s: &mut HeddleState, repo_id: &str, now: u64, base: &PathBuf) {
     let Some(rs) = s.repo_states.get_mut(repo_id) else {
         return;
     };
@@ -2411,14 +2438,14 @@ fn stitch_chain(rs: &RepoState, head: Option<&String>) -> Vec<Stitch> {
     chain
 }
 
-fn find_repo_of_lease(s: &LoomState, lease_id: &str) -> Option<String> {
+fn find_repo_of_lease(s: &HeddleState, lease_id: &str) -> Option<String> {
     s.repo_states
         .iter()
         .find(|(_, rs)| rs.leases.iter().any(|l| l.id == lease_id))
         .map(|(id, _)| id.clone())
 }
 
-fn find_repo_of_thread(s: &LoomState, thread_id: &str) -> Option<String> {
+fn find_repo_of_thread(s: &HeddleState, thread_id: &str) -> Option<String> {
     s.repo_states
         .iter()
         .find(|(_, rs)| rs.threads.iter().any(|t| t.id == thread_id))
@@ -2428,7 +2455,7 @@ fn find_repo_of_thread(s: &LoomState, thread_id: &str) -> Option<String> {
 /// Bounded history, live objects never dropped to make room: terminal
 /// (Woven) threads go oldest-first; stitches beyond the per-thread cap drop
 /// oldest-first except a thread's head; weaves and toe-steps are rings.
-fn prune(s: &mut LoomState) {
+fn prune(s: &mut HeddleState) {
     for rs in s.repo_states.values_mut() {
         while rs.threads.len() > MAX_THREADS_PER_REPO {
             let Some(pos) = rs
@@ -2505,7 +2532,7 @@ mod tests {
 
     fn scratch(tag: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!(
-            "loom-{tag}-{}-{}",
+            "heddle-{tag}-{}-{}",
             std::process::id(),
             now_ms()
         ));
@@ -2523,18 +2550,18 @@ mod tests {
         }
     }
 
-    fn rig(tag: &str) -> (Loom, PathBuf, RepoConfig) {
+    fn rig(tag: &str) -> (Heddle, PathBuf, RepoConfig) {
         let base = scratch(&format!("{tag}-data"));
         let repo_dir = scratch(&format!("{tag}-repo"));
         mk_repo(
             &repo_dir,
             &[("src/main.rs", "fn main() {}\n"), ("README.md", "hi\n")],
         );
-        let loom = Loom::at(base.clone());
-        let repo = loom
+        let heddle = Heddle::at(base.clone());
+        let repo = heddle
             .register_repo(repo_dir.to_str().unwrap(), Some("true".into()), false)
             .expect("register");
-        (loom, repo_dir, repo)
+        (heddle, repo_dir, repo)
     }
 
     #[test]
@@ -2547,37 +2574,37 @@ mod tests {
 
     #[test]
     fn reregistering_the_same_dir_updates_in_place() {
-        let (loom, repo_dir, repo) = rig("rereg");
-        let again = loom
+        let (heddle, repo_dir, repo) = rig("rereg");
+        let again = heddle
             .register_repo(repo_dir.to_str().unwrap(), Some("false".into()), true)
             .expect("re-register");
         assert_eq!(again.id, repo.id);
         assert_eq!(again.verify_cmd, "false");
         assert!(again.git_bridge);
-        assert_eq!(loom.snapshot().repos.len(), 1);
+        assert_eq!(heddle.snapshot().repos.len(), 1);
     }
 
     #[test]
     fn stitch_dedups_unchanged_content_and_manifests() {
-        let (loom, repo_dir, repo) = rig("dedup");
-        let d = loom
+        let (heddle, repo_dir, repo) = rig("dedup");
+        let d = heddle
             .declare_lease(&repo.id, "tester", "touch src", vec!["src/**".into()], vec![], None)
             .expect("lease");
-        let s1 = loom.stitch(&d.lease.id).expect("stitch 1");
+        let s1 = heddle.stitch(&d.lease.id).expect("stitch 1");
         assert!(!s1.unchanged);
         assert_eq!(s1.stitch.files.len(), 1); // src/main.rs only — README out of scope
         // Same content again: NO new stitch.
-        let s2 = loom.stitch(&d.lease.id).expect("stitch 2");
+        let s2 = heddle.stitch(&d.lease.id).expect("stitch 2");
         assert!(s2.unchanged);
         assert_eq!(s2.stitch.id, s1.stitch.id);
         // Change the file: new stitch, new hash, parent chained.
         mk_repo(&repo_dir, &[("src/main.rs", "fn main() { /* v2 */ }\n")]);
-        let s3 = loom.stitch(&d.lease.id).expect("stitch 3");
+        let s3 = heddle.stitch(&d.lease.id).expect("stitch 3");
         assert!(!s3.unchanged);
         assert_eq!(s3.stitch.parent.as_deref(), Some(s1.stitch.id.as_str()));
         assert_ne!(s3.stitch.files["src/main.rs"], s1.stitch.files["src/main.rs"]);
         // Content-addressing: both blobs exist exactly once each.
-        let objects = store::objects_dir(&loom.base(), &repo.id);
+        let objects = store::objects_dir(&heddle.base(), &repo.id);
         for h in [&s1.stitch.files["src/main.rs"], &s3.stitch.files["src/main.rs"]] {
             assert!(store::read_blob(&objects, h).is_ok(), "blob {h} present");
         }
@@ -2585,8 +2612,8 @@ mod tests {
 
     #[test]
     fn orphan_expiry_then_adopt_preserves_goal_and_criteria() {
-        let (loom, _repo_dir, repo) = rig("orphan");
-        let d = loom
+        let (heddle, _repo_dir, repo) = rig("orphan");
+        let d = heddle
             .declare_lease(
                 &repo.id,
                 "first-holder",
@@ -2597,23 +2624,23 @@ mod tests {
             )
             .expect("lease");
         // Not yet expired: still active.
-        loom.reconcile();
-        let snap = loom.snapshot();
+        heddle.reconcile();
+        let snap = heddle.snapshot();
         let rs = &snap.repo_states[&repo.id];
         assert_eq!(rs.threads[0].status, ThreadStatus::Active);
         // Age the heartbeat past TTL by editing state directly (no sleeping
         // in tests), then reconcile.
-        loom.with(|s, _| {
+        heddle.with(|s, _| {
             s.repo_states.get_mut(&repo.id).unwrap().leases[0].last_heartbeat_ms = 1;
         });
-        loom.reconcile();
-        let snap = loom.snapshot();
+        heddle.reconcile();
+        let snap = heddle.snapshot();
         let rs = &snap.repo_states[&repo.id];
         assert_eq!(rs.threads[0].status, ThreadStatus::Orphaned);
         // Heartbeat is refused once orphaned.
-        assert!(loom.heartbeat(&d.lease.id).is_err());
+        assert!(heddle.heartbeat(&d.lease.id).is_err());
         // Adopt: same lease id, new holder, fresh heartbeat, criteria intact.
-        let (thread, lease) = loom.adopt(&d.thread.id, "second-holder").expect("adopt");
+        let (thread, lease) = heddle.adopt(&d.thread.id, "second-holder").expect("adopt");
         assert_eq!(thread.status, ThreadStatus::Adopted);
         assert_eq!(lease.id, d.lease.id);
         assert_eq!(lease.holder, "second-holder");
@@ -2621,46 +2648,46 @@ mod tests {
         assert_eq!(lease.criteria, vec!["tests pass".to_string()]);
         assert!(!lease.expired(now_ms()));
         // Adopted has Active semantics: heartbeat works again.
-        assert!(loom.heartbeat(&d.lease.id).is_ok());
+        assert!(heddle.heartbeat(&d.lease.id).is_ok());
     }
 
     #[test]
     fn weave_gate_green_lands_only_via_land_weave_and_red_never_does() {
-        let (loom, repo_dir, repo) = rig("gate");
-        let d = loom
+        let (heddle, repo_dir, repo) = rig("gate");
+        let d = heddle
             .declare_lease(&repo.id, "t", "greenify", vec!["src/**".into()], vec![], None)
             .expect("lease");
-        loom.stitch(&d.lease.id).expect("stitch");
+        heddle.stitch(&d.lease.id).expect("stitch");
         // verify_cmd is "true" → green; thread flips to Proposed, fabric
         // untouched until land.
-        let out = loom.propose(&d.thread.id).expect("propose");
+        let out = heddle.propose(&d.thread.id).expect("propose");
         assert!(out.green);
         assert_eq!(out.thread.status, ThreadStatus::Proposed);
-        assert!(loom.snapshot().repo_states[&repo.id].fabric.tip.is_none());
+        assert!(heddle.snapshot().repo_states[&repo.id].fabric.tip.is_none());
         // A second propose while one is in flight is refused.
-        assert!(loom.propose(&d.thread.id).is_err());
+        assert!(heddle.propose(&d.thread.id).is_err());
         // Land (callers reach this only after an explicit human yes).
-        let landed = loom.land_weave(&out.weave.id).expect("land");
+        let landed = heddle.land_weave(&out.weave.id).expect("land");
         assert_eq!(landed.thread.status, ThreadStatus::Woven);
-        let snap = loom.snapshot();
+        let snap = heddle.snapshot();
         let rs = &snap.repo_states[&repo.id];
         assert_eq!(rs.fabric.tip.as_deref(), Some(out.weave.id.as_str()));
         assert_eq!(rs.fabric.history, vec![out.weave.id.clone()]);
         assert!(rs.leases.is_empty(), "lease released on land");
         // Red: new thread, repo re-registered with a failing verify.
-        loom.register_repo(repo_dir.to_str().unwrap(), Some("false".into()), false)
+        heddle.register_repo(repo_dir.to_str().unwrap(), Some("false".into()), false)
             .expect("re-register red");
-        let d2 = loom
+        let d2 = heddle
             .declare_lease(&repo.id, "t", "reddify", vec!["src/**".into()], vec![], None)
             .expect("lease 2");
-        loom.stitch(&d2.lease.id).expect("stitch 2");
-        let out2 = loom.propose(&d2.thread.id).expect("propose 2");
+        heddle.stitch(&d2.lease.id).expect("stitch 2");
+        let out2 = heddle.propose(&d2.thread.id).expect("propose 2");
         assert!(!out2.green);
         assert_eq!(out2.thread.status, ThreadStatus::Active, "red keeps the thread active");
         assert!(out2.thread.note.starts_with("verify red"));
         // Red can never land, even if someone tries.
-        assert!(loom.land_weave(&out2.weave.id).is_err());
-        let snap = loom.snapshot();
+        assert!(heddle.land_weave(&out2.weave.id).is_err());
+        let snap = heddle.snapshot();
         assert_eq!(
             snap.repo_states[&repo.id].fabric.history.len(),
             1,
@@ -2670,34 +2697,34 @@ mod tests {
 
     #[test]
     fn fabric_ordering_a_stale_parent_refuses_to_land_until_reproposed() {
-        let (loom, _repo_dir, repo) = rig("order");
+        let (heddle, _repo_dir, repo) = rig("order");
         let mk = |goal: &str, scope: &str| {
-            let d = loom
+            let d = heddle
                 .declare_lease(&repo.id, "t", goal, vec![scope.into()], vec![], None)
                 .expect("lease");
-            loom.stitch(&d.lease.id).expect("stitch");
-            let proposed = loom.propose(&d.thread.id).expect("propose");
+            heddle.stitch(&d.lease.id).expect("stitch");
+            let proposed = heddle.propose(&d.thread.id).expect("propose");
             (d, proposed)
         };
         let (_d1, w1) = mk("first", "src/**");
         let (d2, w2) = mk("second", "README.md");
         // Both verified against an empty fabric; first lands fine.
-        loom.land_weave(&w1.weave.id).expect("land w1");
+        heddle.land_weave(&w1.weave.id).expect("land w1");
         // Second's parent is stale — refused, honestly noted.
-        let err = loom.land_weave(&w2.weave.id).unwrap_err();
+        let err = heddle.land_weave(&w2.weave.id).unwrap_err();
         assert!(err.contains("re-propose"), "got: {err}");
         // Thread 2 must re-propose... but it is Proposed; deny path resets
         // nothing, so flip via a fresh propose after the note. v1 keeps this
         // manual: adopt/propose guards mean we go through deny first.
-        loom.with(|s, _| {
+        heddle.with(|s, _| {
             let rs = s.repo_states.get_mut(&repo.id).unwrap();
             let t = rs.threads.iter_mut().find(|t| t.id == d2.thread.id).unwrap();
             t.status = ThreadStatus::Active; // simulate agent acting on the note
         });
-        let w2b = loom.propose(&d2.thread.id).expect("re-propose");
+        let w2b = heddle.propose(&d2.thread.id).expect("re-propose");
         assert_eq!(w2b.weave.fabric_parent.as_deref(), Some(w1.weave.id.as_str()));
-        loom.land_weave(&w2b.weave.id).expect("land w2b");
-        let snap = loom.snapshot();
+        heddle.land_weave(&w2b.weave.id).expect("land w2b");
+        let snap = heddle.snapshot();
         assert_eq!(
             snap.repo_states[&repo.id].fabric.history,
             vec![w1.weave.id.clone(), w2b.weave.id.clone()],
@@ -2707,15 +2734,15 @@ mod tests {
 
     #[test]
     fn deny_keeps_the_thread_proposed_with_the_note() {
-        let (loom, _repo_dir, repo) = rig("deny");
-        let d = loom
+        let (heddle, _repo_dir, repo) = rig("deny");
+        let d = heddle
             .declare_lease(&repo.id, "t", "goal", vec!["src/**".into()], vec![], None)
             .expect("lease");
-        loom.stitch(&d.lease.id).expect("stitch");
-        let out = loom.propose(&d.thread.id).expect("propose");
-        loom.mark_parked(&d.thread.id, "appr-1").expect("mark parked");
-        loom.deny_weave(&out.weave.id, "denied by operator").expect("deny");
-        let snap = loom.snapshot();
+        heddle.stitch(&d.lease.id).expect("stitch");
+        let out = heddle.propose(&d.thread.id).expect("propose");
+        heddle.mark_parked(&d.thread.id, "appr-1").expect("mark parked");
+        heddle.deny_weave(&out.weave.id, "denied by operator").expect("deny");
+        let snap = heddle.snapshot();
         let t = &snap.repo_states[&repo.id].threads[0];
         assert_eq!(t.status, ThreadStatus::Proposed);
         assert_eq!(t.note, "denied by operator");
@@ -2727,66 +2754,66 @@ mod tests {
 
     #[test]
     fn withdraw_returns_a_proposed_thread_to_active_and_allows_repropose() {
-        let (loom, _repo_dir, repo) = rig("withdraw");
-        let d = loom
+        let (heddle, _repo_dir, repo) = rig("withdraw");
+        let d = heddle
             .declare_lease(&repo.id, "t", "goal", vec!["src/**".into()], vec![], None)
             .expect("lease");
         // Withdraw on a non-proposed thread refuses.
-        assert!(loom.withdraw(&d.thread.id, "").is_err());
-        loom.stitch(&d.lease.id).expect("stitch");
-        let out = loom.propose(&d.thread.id).expect("propose");
+        assert!(heddle.withdraw(&d.thread.id, "").is_err());
+        heddle.stitch(&d.lease.id).expect("stitch");
+        let out = heddle.propose(&d.thread.id).expect("propose");
         assert!(out.green);
-        loom.mark_parked(&d.thread.id, "appr-w").expect("mark parked");
+        heddle.mark_parked(&d.thread.id, "appr-w").expect("mark parked");
         // While Proposed, a second propose is refused — the stuck state.
-        assert!(loom.propose(&d.thread.id).is_err());
+        assert!(heddle.propose(&d.thread.id).is_err());
         // Withdraw: back to Active with the note, approval id handed back so
         // an embedding host can resolve the moot parked approval.
-        let (t, aid) = loom.withdraw(&d.thread.id, "").expect("withdraw");
+        let (t, aid) = heddle.withdraw(&d.thread.id, "").expect("withdraw");
         assert_eq!(t.status, ThreadStatus::Active);
         assert_eq!(t.note, "withdrawn — re-propose when ready");
         assert!(t.approval_id.is_none());
         assert_eq!(aid.as_deref(), Some("appr-w"));
         // A late deny for the old weave must not clobber the Active thread.
-        loom.deny_weave(&out.weave.id, "denied by operator").expect("late deny");
-        let snap = loom.snapshot();
+        heddle.deny_weave(&out.weave.id, "denied by operator").expect("late deny");
+        let snap = heddle.snapshot();
         let t = &snap.repo_states[&repo.id].threads[0];
         assert_eq!(t.status, ThreadStatus::Active);
         assert_eq!(t.note, "withdrawn — re-propose when ready");
         // And re-propose works.
-        let again = loom.propose(&d.thread.id).expect("re-propose");
+        let again = heddle.propose(&d.thread.id).expect("re-propose");
         assert!(again.green);
         assert_eq!(again.thread.status, ThreadStatus::Proposed);
     }
 
     #[test]
     fn a_lapsed_parked_approval_reconciles_the_thread_back_to_active() {
-        let (loom, _repo_dir, repo) = rig("lapse");
-        let d = loom
+        let (heddle, _repo_dir, repo) = rig("lapse");
+        let d = heddle
             .declare_lease(&repo.id, "t", "goal", vec!["src/**".into()], vec![], None)
             .expect("lease");
-        loom.stitch(&d.lease.id).expect("stitch");
-        loom.propose(&d.thread.id).expect("propose");
-        loom.mark_parked(&d.thread.id, "appr-live").expect("mark parked");
+        heddle.stitch(&d.lease.id).expect("stitch");
+        heddle.propose(&d.thread.id).expect("propose");
+        heddle.mark_parked(&d.thread.id, "appr-live").expect("mark parked");
         // The approval is still pending → nothing changes.
         let pending: std::collections::HashSet<String> =
             ["appr-live".to_string()].into_iter().collect();
-        loom.reconcile_parked(&pending);
-        let t = loom.snapshot().repo_states[&repo.id].threads[0].clone();
+        heddle.reconcile_parked(&pending);
+        let t = heddle.snapshot().repo_states[&repo.id].threads[0].clone();
         assert_eq!(t.status, ThreadStatus::Proposed);
         assert_eq!(t.approval_id.as_deref(), Some("appr-live"));
         // The approval vanished (a host restart or timeout killed it — they
         // are in-memory only) → the thread returns to Active, honestly noted.
-        loom.reconcile_parked(&std::collections::HashSet::new());
-        let t = loom.snapshot().repo_states[&repo.id].threads[0].clone();
+        heddle.reconcile_parked(&std::collections::HashSet::new());
+        let t = heddle.snapshot().repo_states[&repo.id].threads[0].clone();
         assert_eq!(t.status, ThreadStatus::Active);
         assert_eq!(t.note, "approval lapsed — re-propose when ready");
         assert!(t.approval_id.is_none());
         // Recovery is real: propose works again.
-        assert!(loom.propose(&d.thread.id).expect("re-propose").green);
+        assert!(heddle.propose(&d.thread.id).expect("re-propose").green);
         // A Proposed thread with NO recorded approval id (mid-gate) is never
         // touched by reconcile — only `withdraw` may move it.
-        loom.reconcile_parked(&std::collections::HashSet::new());
-        let t = loom.snapshot().repo_states[&repo.id].threads[0].clone();
+        heddle.reconcile_parked(&std::collections::HashSet::new());
+        let t = heddle.snapshot().repo_states[&repo.id].threads[0].clone();
         assert_eq!(t.status, ThreadStatus::Proposed, "no approval id → left alone");
     }
 
@@ -2808,7 +2835,7 @@ mod tests {
 
     /// A rig whose repo is a real git repo with one commit — isolation
     /// activates under Auto.
-    fn git_rig(tag: &str) -> (Loom, PathBuf, RepoConfig) {
+    fn git_rig(tag: &str) -> (Heddle, PathBuf, RepoConfig) {
         let base = scratch(&format!("{tag}-data"));
         let repo_dir = scratch(&format!("{tag}-repo"));
         mk_repo(
@@ -2819,15 +2846,15 @@ mod tests {
             ],
         );
         git_ok(&repo_dir, &["init", "-q"]);
-        git_ok(&repo_dir, &["config", "user.email", "loom@test"]);
-        git_ok(&repo_dir, &["config", "user.name", "loom test"]);
+        git_ok(&repo_dir, &["config", "user.email", "heddle@test"]);
+        git_ok(&repo_dir, &["config", "user.name", "heddle test"]);
         git_ok(&repo_dir, &["add", "-A"]);
         git_ok(&repo_dir, &["commit", "-q", "-m", "base"]);
-        let loom = Loom::at(base);
-        let repo = loom
+        let heddle = Heddle::at(base);
+        let repo = heddle
             .register_repo(repo_dir.to_str().unwrap(), Some("true".into()), false)
             .expect("register");
-        (loom, repo_dir, repo)
+        (heddle, repo_dir, repo)
     }
 
     fn read(p: &std::path::Path) -> String {
@@ -2836,8 +2863,8 @@ mod tests {
 
     #[test]
     fn isolated_lease_gets_a_worktree_and_edits_there_never_touch_the_repo() {
-        let (loom, repo_dir, repo) = git_rig("iso");
-        let d = loom
+        let (heddle, repo_dir, repo) = git_rig("iso");
+        let d = heddle
             .declare_lease(&repo.id, "t", "solo work", vec!["src/**".into()], vec![], None)
             .expect("lease");
         let wt = d.thread.worktree.clone().expect("isolated by default on a git repo");
@@ -2846,29 +2873,29 @@ mod tests {
         let wt = PathBuf::from(&wt);
         assert!(wt.join("src/main.rs").exists(), "worktree has HEAD's files");
         // No edits yet: stitch reports unchanged vs the base, head stays None.
-        let s0 = loom.stitch(&d.lease.id).expect("stitch 0");
+        let s0 = heddle.stitch(&d.lease.id).expect("stitch 0");
         assert!(s0.unchanged);
         // Edit IN THE WORKTREE.
         std::fs::write(wt.join("src/main.rs"), "fn main() { /* wt */ }\n").unwrap();
-        let s1 = loom.stitch(&d.lease.id).expect("stitch 1");
+        let s1 = heddle.stitch(&d.lease.id).expect("stitch 1");
         assert!(!s1.unchanged);
         // The repo tree is untouched by leasing, editing, stitching.
         assert_eq!(read(&repo_dir.join("src/main.rs")), "fn main() {}\n");
         // Green weave + land applies ONLY the thread's delta to the repo.
-        let out = loom.propose(&d.thread.id).expect("propose");
+        let out = heddle.propose(&d.thread.id).expect("propose");
         assert!(out.green);
-        let landed = loom.land_weave(&out.weave.id).expect("land");
+        let landed = heddle.land_weave(&out.weave.id).expect("land");
         assert_eq!(landed.files_applied, 1, "only the changed file lands");
         assert_eq!(read(&repo_dir.join("src/main.rs")), "fn main() { /* wt */ }\n");
     }
 
     #[test]
     fn two_threads_overlap_first_lands_second_refused_then_rebase_then_lands() {
-        let (loom, repo_dir, repo) = git_rig("pair");
-        let da = loom
+        let (heddle, repo_dir, repo) = git_rig("pair");
+        let da = heddle
             .declare_lease(&repo.id, "alice", "restyle main", vec!["src/**".into()], vec![], None)
             .expect("lease a");
-        let db = loom
+        let db = heddle
             .declare_lease(&repo.id, "bob", "rework main too", vec!["src/**".into()], vec![], None)
             .expect("lease b");
         assert!(!db.toe_steps.is_empty(), "overlap warned at declaration");
@@ -2880,20 +2907,20 @@ mod tests {
         std::fs::write(wa.join("src/main.rs"), "fn main() { /* alice */ }\n").unwrap();
         std::fs::write(wa.join("src/util.rs"), "pub fn u() { /* alice */ }\n").unwrap();
         std::fs::write(wb.join("src/main.rs"), "fn main() { /* bob */ }\n").unwrap();
-        loom.stitch(&da.lease.id).expect("stitch a");
-        loom.stitch(&db.lease.id).expect("stitch b");
+        heddle.stitch(&da.lease.id).expect("stitch a");
+        heddle.stitch(&db.lease.id).expect("stitch b");
         // No clobbering happened: both worktrees hold their own versions.
         assert!(read(&wa.join("src/main.rs")).contains("alice"));
         assert!(read(&wb.join("src/main.rs")).contains("bob"));
         // Alice lands first.
-        let pa = loom.propose(&da.thread.id).expect("propose a");
-        loom.land_weave(&pa.weave.id).expect("land a");
+        let pa = heddle.propose(&da.thread.id).expect("propose a");
+        heddle.land_weave(&pa.weave.id).expect("land a");
         assert!(read(&repo_dir.join("src/main.rs")).contains("alice"));
         // Bob's verify is green — but landing refuses honestly: the fabric
         // moved under him on the shared file.
-        let pb = loom.propose(&db.thread.id).expect("propose b");
+        let pb = heddle.propose(&db.thread.id).expect("propose b");
         assert!(pb.green);
-        let err = loom.land_weave(&pb.weave.id).unwrap_err();
+        let err = heddle.land_weave(&pb.weave.id).unwrap_err();
         assert!(err.contains("fabric moved under you"), "{err}");
         assert!(err.contains("src/main.rs"), "{err}");
         assert!(err.contains("rebase"), "{err}");
@@ -2901,7 +2928,7 @@ mod tests {
         assert!(read(&repo_dir.join("src/main.rs")).contains("alice"));
         // Rebase: util.rs (fabric-only) fast-forwards, main.rs conflicts
         // and keeps Bob's version.
-        let rb = loom.rebase_thread(&db.thread.id).expect("rebase b");
+        let rb = heddle.rebase_thread(&db.thread.id).expect("rebase b");
         assert_eq!(rb.conflicts, vec!["src/main.rs".to_string()]);
         assert!(rb.fast_forwarded.contains(&"src/util.rs".to_string()));
         assert!(read(&wb.join("src/util.rs")).contains("alice"), "fabric ff'd in");
@@ -2909,10 +2936,10 @@ mod tests {
         assert_eq!(rb.thread.status, ThreadStatus::Active);
         // Bob reconciles by hand, re-stitches, re-proposes — and lands.
         std::fs::write(wb.join("src/main.rs"), "fn main() { /* alice+bob */ }\n").unwrap();
-        loom.stitch(&db.lease.id).expect("stitch b2");
-        let pb2 = loom.propose(&db.thread.id).expect("propose b2");
+        heddle.stitch(&db.lease.id).expect("stitch b2");
+        let pb2 = heddle.propose(&db.thread.id).expect("propose b2");
         assert!(pb2.green);
-        loom.land_weave(&pb2.weave.id).expect("land b2");
+        heddle.land_weave(&pb2.weave.id).expect("land b2");
         assert!(read(&repo_dir.join("src/main.rs")).contains("alice+bob"));
         // util.rs kept Alice's version — Bob's stale base never overwrote it.
         assert!(read(&repo_dir.join("src/util.rs")).contains("alice"));
@@ -2921,8 +2948,8 @@ mod tests {
     #[test]
     fn isolation_modes_in_place_flag_plain_dirs_and_isolated_refusal() {
         // A git repo with --in-place behaves like v0.1: no worktree.
-        let (loom, _repo_dir, repo) = git_rig("modes");
-        let d = loom
+        let (heddle, _repo_dir, repo) = git_rig("modes");
+        let d = heddle
             .declare_lease_mode(
                 &repo.id, "t", "old style", vec!["src/**".into()], vec![], None,
                 IsolationMode::InPlace,
@@ -2932,20 +2959,20 @@ mod tests {
         assert!(d.thread.base_stitch.is_none());
         assert_eq!(d.working_dir, repo.path);
         // A plain directory under Auto works in place too.
-        let (loom2, _dir2, repo2) = rig("modes-plain");
-        let d2 = loom2
+        let (heddle2, _dir2, repo2) = rig("modes-plain");
+        let d2 = heddle2
             .declare_lease(&repo2.id, "t", "plain", vec!["src/**".into()], vec![], None)
             .expect("plain lease");
         assert!(d2.thread.worktree.is_none());
         // Demanding isolation on a plain directory fails AND rolls back.
-        let err = loom2
+        let err = heddle2
             .declare_lease_mode(
                 &repo2.id, "t", "must isolate", vec!["src/**".into()], vec![], None,
                 IsolationMode::Isolated,
             )
             .unwrap_err();
         assert!(err.contains("worktree setup failed"), "{err}");
-        let snap = loom2.snapshot();
+        let snap = heddle2.snapshot();
         assert_eq!(
             snap.repo_states[&repo2.id].threads.len(),
             1,
@@ -2955,45 +2982,45 @@ mod tests {
 
     #[test]
     fn deletions_are_tombstoned_applied_on_land_and_conflict_on_fabric_edit() {
-        let (loom, repo_dir, repo) = git_rig("del");
+        let (heddle, repo_dir, repo) = git_rig("del");
         // Thread 1 deletes util.rs in its worktree.
-        let d = loom
+        let d = heddle
             .declare_lease(&repo.id, "t", "drop util", vec!["src/**".into()], vec![], None)
             .expect("lease");
         let wt = PathBuf::from(d.thread.worktree.as_ref().unwrap());
         std::fs::remove_file(wt.join("src/util.rs")).unwrap();
-        let s = loom.stitch(&d.lease.id).expect("stitch");
+        let s = heddle.stitch(&d.lease.id).expect("stitch");
         assert_eq!(
             s.stitch.files.get("src/util.rs").map(String::as_str),
             Some(TOMBSTONE),
             "deletion recorded as a tombstone"
         );
-        let p = loom.propose(&d.thread.id).expect("propose");
+        let p = heddle.propose(&d.thread.id).expect("propose");
         assert!(p.green);
-        loom.land_weave(&p.weave.id).expect("land");
+        heddle.land_weave(&p.weave.id).expect("land");
         assert!(!repo_dir.join("src/util.rs").exists(), "weave applied the deletion");
         // Thread 2 deletes main.rs — but the fabric edits it meanwhile:
         // delete-vs-edit is a conflict, refused honestly.
-        let d2 = loom
+        let d2 = heddle
             .declare_lease(&repo.id, "t", "drop main", vec!["src/**".into()], vec![], None)
             .expect("lease 2");
         let wt2 = PathBuf::from(d2.thread.worktree.as_ref().unwrap());
         std::fs::remove_file(wt2.join("src/main.rs")).unwrap();
-        loom.stitch(&d2.lease.id).expect("stitch 2");
+        heddle.stitch(&d2.lease.id).expect("stitch 2");
         std::fs::write(repo_dir.join("src/main.rs"), "fn main() { /* moved */ }\n").unwrap();
-        let p2 = loom.propose(&d2.thread.id).expect("propose 2");
+        let p2 = heddle.propose(&d2.thread.id).expect("propose 2");
         assert!(p2.green);
-        let err = loom.land_weave(&p2.weave.id).unwrap_err();
+        let err = heddle.land_weave(&p2.weave.id).unwrap_err();
         assert!(err.contains("fabric moved under you"), "{err}");
         assert!(repo_dir.join("src/main.rs").exists(), "nothing was deleted");
         // In-place threads track deletions vs their previous stitch too.
-        let (loom3, dir3, repo3) = rig("del-inplace");
-        let d3 = loom3
+        let (heddle3, dir3, repo3) = rig("del-inplace");
+        let d3 = heddle3
             .declare_lease(&repo3.id, "t", "prune", vec!["src/**".into()], vec![], None)
             .expect("lease 3");
-        loom3.stitch(&d3.lease.id).expect("stitch 3a");
+        heddle3.stitch(&d3.lease.id).expect("stitch 3a");
         std::fs::remove_file(dir3.join("src/main.rs")).unwrap();
-        let s3 = loom3.stitch(&d3.lease.id).expect("stitch 3b");
+        let s3 = heddle3.stitch(&d3.lease.id).expect("stitch 3b");
         assert_eq!(
             s3.stitch.files.get("src/main.rs").map(String::as_str),
             Some(TOMBSTONE)
@@ -3002,8 +3029,8 @@ mod tests {
 
     #[test]
     fn adopt_hands_over_the_worktree_or_materializes_one() {
-        let (loom, _repo_dir, repo) = git_rig("adopt-wt");
-        let d = loom
+        let (heddle, _repo_dir, repo) = git_rig("adopt-wt");
+        let d = heddle
             .declare_lease(
                 &repo.id, "first", "half-done work", vec!["src/**".into()], vec![],
                 Some(MIN_TTL_MS),
@@ -3015,14 +3042,14 @@ mod tests {
             "fn main() { /* half */ }\n",
         )
         .unwrap();
-        loom.stitch(&d.lease.id).expect("stitch");
+        heddle.stitch(&d.lease.id).expect("stitch");
         // The holder dies (heartbeat ages out); the thread orphans.
-        loom.with(|s, _| {
+        heddle.with(|s, _| {
             s.repo_states.get_mut(&repo.id).unwrap().leases[0].last_heartbeat_ms = 1;
         });
-        loom.reconcile();
+        heddle.reconcile();
         // Adoption hands over the SAME worktree, work intact.
-        let (thread, _lease) = loom.adopt(&d.thread.id, "second").expect("adopt");
+        let (thread, _lease) = heddle.adopt(&d.thread.id, "second").expect("adopt");
         assert_eq!(thread.worktree.as_deref(), Some(wt.as_str()));
         assert!(read(&PathBuf::from(&wt).join("src/main.rs")).contains("half"));
         // An orphan WITHOUT a worktree (imported from another machine)
@@ -3032,7 +3059,7 @@ mod tests {
             repo_id: repo.id.clone(),
             goal: "imported work".into(),
             head_stitch: Some(
-                loom.snapshot().repo_states[&repo.id]
+                heddle.snapshot().repo_states[&repo.id]
                     .stitches
                     .iter()
                     .rev()
@@ -3061,7 +3088,7 @@ mod tests {
             last_heartbeat_ms: 1,
         };
         let head_id = imported.head_stitch.clone().unwrap();
-        loom.with(|s, _| {
+        heddle.with(|s, _| {
             let rs = s.repo_states.get_mut(&repo.id).unwrap();
             let mut st = rs.stitches.iter().find(|st| st.id == head_id).unwrap().clone();
             st.id = "stitch-import-1".into();
@@ -3071,9 +3098,9 @@ mod tests {
         });
         let mut imported = imported;
         imported.head_stitch = Some("stitch-import-1".into());
-        loom.import_thread(&repo.id, imported, lease, vec![], "m-elsewhere")
+        heddle.import_thread(&repo.id, imported, lease, vec![], "m-elsewhere")
             .expect("import");
-        let (t2, _l2) = loom.adopt("thread-import-1", "adopter").expect("adopt imported");
+        let (t2, _l2) = heddle.adopt("thread-import-1", "adopter").expect("adopt imported");
         let wt2 = t2.worktree.expect("worktree materialized");
         assert!(read(&PathBuf::from(&wt2).join("src/main.rs")).contains("half"));
         assert!(t2.base_stitch.is_some(), "based against OUR tree");
@@ -3081,22 +3108,22 @@ mod tests {
 
     #[test]
     fn clean_removes_only_captured_woven_worktrees() {
-        let (loom, _repo_dir, repo) = git_rig("clean");
-        let d = loom
+        let (heddle, _repo_dir, repo) = git_rig("clean");
+        let d = heddle
             .declare_lease(&repo.id, "t", "finish and clean", vec!["src/**".into()], vec![], None)
             .expect("lease");
         let wt = PathBuf::from(d.thread.worktree.as_ref().unwrap());
         std::fs::write(wt.join("src/main.rs"), "fn main() { /* done */ }\n").unwrap();
-        loom.stitch(&d.lease.id).expect("stitch");
-        let p = loom.propose(&d.thread.id).expect("propose");
-        loom.land_weave(&p.weave.id).expect("land");
+        heddle.stitch(&d.lease.id).expect("stitch");
+        let p = heddle.propose(&d.thread.id).expect("propose");
+        heddle.land_weave(&p.weave.id).expect("land");
         // A live thread's worktree is never cleaned.
-        let d2 = loom
+        let d2 = heddle
             .declare_lease(&repo.id, "t", "still working", vec!["src/**".into()], vec![], None)
             .expect("lease 2");
         // Divergence after weaving: refuse (uncaptured bytes would be lost).
         std::fs::write(wt.join("src/main.rs"), "fn main() { /* uncaptured */ }\n").unwrap();
-        let report = loom.clean_worktrees(&repo.id).expect("clean 1");
+        let report = heddle.clean_worktrees(&repo.id).expect("clean 1");
         assert!(report.removed.is_empty());
         assert!(report
             .skipped
@@ -3108,10 +3135,10 @@ mod tests {
             .any(|(tid, why)| tid == &d2.thread.id && why.contains("in use")));
         // Restore the captured content: now the woven worktree goes.
         std::fs::write(wt.join("src/main.rs"), "fn main() { /* done */ }\n").unwrap();
-        let report = loom.clean_worktrees(&repo.id).expect("clean 2");
+        let report = heddle.clean_worktrees(&repo.id).expect("clean 2");
         assert!(report.removed.iter().any(|(tid, _)| tid == &d.thread.id));
         assert!(!wt.exists());
-        let snap = loom.snapshot();
+        let snap = heddle.snapshot();
         let t = snap.repo_states[&repo.id]
             .threads
             .iter()
@@ -3125,20 +3152,20 @@ mod tests {
 
     #[test]
     fn state_survives_a_cache_drop_and_a_corrupt_log_line() {
-        let (loom, _repo_dir, repo) = rig("persist");
-        loom.declare_lease(&repo.id, "t", "goal", vec!["src/**".into()], vec![], None)
+        let (heddle, _repo_dir, repo) = rig("persist");
+        heddle.declare_lease(&repo.id, "t", "goal", vec!["src/**".into()], vec![], None)
             .expect("lease");
         // Corrupt the log mid-file; state.json untouched.
-        let log = loom.base().join(&repo.id).join("log.jsonl");
+        let log = heddle.base().join(&repo.id).join("log.jsonl");
         let mut f = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
         f.write_all(b"{ this is not json\n").unwrap();
         drop(f);
-        loom.reset_cache();
-        let snap = loom.snapshot();
+        heddle.reset_cache();
+        let snap = heddle.snapshot();
         assert_eq!(snap.repos.len(), 1);
         assert_eq!(snap.repo_states[&repo.id].threads.len(), 1);
         // The readable events survive around the corrupt line.
-        let events = store::read_events(&loom.base(), &repo.id, 50);
+        let events = store::read_events(&heddle.base(), &repo.id, 50);
         assert!(events.iter().any(|e| e["kind"] == "lease_declared"));
     }
 }

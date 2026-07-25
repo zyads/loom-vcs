@@ -1,4 +1,4 @@
-// Loom — version control for many hands moving at once.
+// Heddle — version control for many hands moving at once.
 // Copyright (c) 2026 Aether-OS contributors. MIT license; see LICENSE.
 
 //! Lease scope globs, overlap detection, and toe-step warnings.
