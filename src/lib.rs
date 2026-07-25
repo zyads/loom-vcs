@@ -439,6 +439,13 @@ pub struct Heddle {
     inner: Mutex<Option<HeddleState>>,
 }
 
+/// Pre-rename names (formerly loom-vcs): compatibility aliases so embedders
+/// written against `loom::Loom` keep compiling. New code should say
+/// [`Heddle`] / [`HeddleState`].
+pub type Loom = Heddle;
+#[doc(hidden)]
+pub type LoomState = HeddleState;
+
 /// The process-wide engine, rooted at the default data dir (`HEDDLE_DATA` env
 /// var when set, else `~/.heddle` — resolved fresh on every touch).
 pub fn store() -> &'static Heddle {
