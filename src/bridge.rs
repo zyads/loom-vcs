@@ -90,6 +90,8 @@ mod tests {
                 verify_cmd: "cargo check".into(),
                 git_bridge: false,
                 registered_ms: 0,
+                sync_remote: None,
+                auto_sync: false,
             },
             thread: Thread {
                 id: "thread-1".into(),
@@ -100,6 +102,8 @@ mod tests {
                 status: ThreadStatus::Woven,
                 note: String::new(),
                 approval_id: None,
+                worktree: None,
+                base_stitch: None,
             },
             weave: Weave {
                 id: "weave-9".into(),
@@ -111,6 +115,7 @@ mod tests {
                     log_tail: String::new(),
                 },
                 ts_ms: 0,
+                applied: Default::default(),
             },
             criteria: vec!["tests pass".into(), "no new warnings".into()],
             files_applied: 3,

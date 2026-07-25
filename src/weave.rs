@@ -26,12 +26,45 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use super::store::{self, MAX_SNAPSHOT_FILE_BYTES};
-use super::{now_ms, RepoConfig, VerifyOutcome, VerifyResult};
+use super::{now_ms, RepoConfig, VerifyOutcome, VerifyResult, TOMBSTONE};
 
-/// Directories never captured, never copied into scratch worktrees. A
-/// minimal, hard-coded stand-in for .gitignore; real gitignore parsing is
-/// future work and the limitation is on purpose (boring beats subtly wrong).
+/// Names never captured, never copied into scratch worktrees, whatever the
+/// entry type — `.git` in particular is a *file* inside a git worktree.
+/// Always excluded; a `.loomignore` can only ADD to this list, never
+/// un-ignore it.
 pub const EXCLUDED_DIRS: &[&str] = &[".git", "target", "node_modules"];
+
+/// Per-repo ignore file at the repo (or worktree) root: one pattern per
+/// line in Loom's own glob grammar (`**`, `*`, `?`; a fully-literal line
+/// ignores that file or everything under that directory), `#` comments and
+/// blank lines skipped. Applied AFTER the built-in excludes above — it
+/// extends them and cannot re-include them.
+pub const LOOMIGNORE_FILE: &str = ".loomignore";
+
+/// Load the root's `.loomignore` patterns (empty when absent/unreadable).
+/// Invalid patterns (absolute, `..`, backslashes) are dropped silently —
+/// an ignore file must never become a path-escape vector.
+pub fn load_loomignore(root: &Path) -> Vec<String> {
+    let Ok(body) = std::fs::read_to_string(root.join(LOOMIGNORE_FILE)) else {
+        return Vec::new();
+    };
+    body.lines()
+        .map(|l| l.trim().trim_start_matches("./").to_string())
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .filter(|l| !l.starts_with('/') && !l.contains('\\'))
+        .filter(|l| !l.split('/').any(|seg| seg == ".." || seg.is_empty()))
+        .take(200)
+        .collect()
+}
+
+/// Does any ignore pattern match this repo-relative path? Works for files
+/// and for directories (a literal pattern matches the directory itself and
+/// everything under it — same rule as lease scopes).
+fn ignored(patterns: &[String], rel: &str) -> bool {
+    patterns
+        .iter()
+        .any(|p| super::lease::glob_match(p, rel) || p == rel)
+}
 
 /// Hard ceiling on one verify run.
 pub const VERIFY_TIMEOUT_SECS: u64 = 300;
@@ -57,6 +90,8 @@ pub fn capture_scope(
     scope: &[String],
     objects: &Path,
 ) -> Result<Captured, String> {
+    let ignore = load_loomignore(root);
+    let max_bytes = max_snapshot_bytes();
     let mut manifest = BTreeMap::new();
     let mut skipped = Vec::new();
     let mut stack = vec![root.to_path_buf()];
@@ -75,15 +110,21 @@ pub fn capture_scope(
             if ft.is_symlink() {
                 continue; // never follow links out of the repo
             }
-            if ft.is_dir() {
-                if !EXCLUDED_DIRS.contains(&name.as_str()) {
-                    stack.push(path);
-                }
+            // Built-in excludes apply to ANY entry type: `.git` is a file
+            // inside a git worktree.
+            if EXCLUDED_DIRS.contains(&name.as_str()) || name == LOOMIGNORE_FILE {
                 continue;
             }
             let Some(rel) = relative_slash(root, &path) else {
                 continue;
             };
+            if ignored(&ignore, &rel) {
+                continue;
+            }
+            if ft.is_dir() {
+                stack.push(path);
+                continue;
+            }
             if !scope.iter().any(|p| super::lease::glob_match(p, &rel)) {
                 continue;
             }
@@ -93,8 +134,13 @@ pub fn capture_scope(
                 ));
             }
             match std::fs::metadata(&path) {
-                Ok(m) if m.len() > MAX_SNAPSHOT_FILE_BYTES => {
-                    skipped.push(format!("{rel} (too large: {} bytes)", m.len()));
+                Ok(m) if m.len() > max_bytes => {
+                    skipped.push(format!(
+                        "{rel} (too large: {} bytes > the {} MiB snapshot cap — \
+                         raise LOOM_MAX_FILE_MB or .loomignore it)",
+                        m.len(),
+                        max_bytes / (1024 * 1024),
+                    ));
                     continue;
                 }
                 Err(e) => {
@@ -151,7 +197,9 @@ pub fn run_gate(
 }
 
 /// Apply a manifest onto a directory (used for BOTH the scratch overlay and
-/// — via `land_weave` only — the real tree). Returns files written.
+/// — via `land_weave` only — the real tree). A [`TOMBSTONE`] entry deletes
+/// the file (deleting what is already absent is a quiet no-op). Returns
+/// files written or deleted.
 pub fn apply_overlay(
     root: &Path,
     manifest: &BTreeMap<String, String>,
@@ -160,6 +208,13 @@ pub fn apply_overlay(
     let mut applied = 0;
     for (rel, hash) in manifest {
         let dest = safe_join(root, rel)?;
+        if hash == TOMBSTONE {
+            if dest.exists() {
+                std::fs::remove_file(&dest).map_err(|e| format!("delete {rel}: {e}"))?;
+                applied += 1;
+            }
+            continue;
+        }
         let bytes = store::read_blob(objects, hash)?;
         if let Some(dir) = dest.parent() {
             std::fs::create_dir_all(dir).map_err(|e| format!("mkdir for {rel}: {e}"))?;
@@ -168,6 +223,95 @@ pub fn apply_overlay(
         applied += 1;
     }
     Ok(applied)
+}
+
+/// Make `dst_root`'s scope files identical to `src_root`'s (copying changed
+/// or missing files, deleting scope files `src_root` does not have), and
+/// return `src_root`'s captured scope — used right after `git worktree add`
+/// so a fresh worktree starts from the FABRIC's live state, not from git
+/// HEAD (landed weaves live in the working tree until the git bridge or a
+/// human commits them). The returned capture is exactly the thread's base.
+pub fn align_tree(
+    src_root: &Path,
+    dst_root: &Path,
+    scope: &[String],
+    objects: &Path,
+) -> Result<Captured, String> {
+    let src = capture_scope(src_root, scope, objects)?;
+    let dst = capture_scope(dst_root, scope, objects)?;
+    for (rel, h) in &src.manifest {
+        if dst.manifest.get(rel) != Some(h) {
+            let bytes = store::read_blob(objects, h)?;
+            let to = safe_join(dst_root, rel)?;
+            if let Some(dir) = to.parent() {
+                std::fs::create_dir_all(dir).map_err(|e| format!("align mkdir {rel}: {e}"))?;
+            }
+            std::fs::write(&to, bytes).map_err(|e| format!("align write {rel}: {e}"))?;
+        }
+    }
+    for rel in dst.manifest.keys() {
+        if !src.manifest.contains_key(rel) {
+            if let Ok(gone) = safe_join(dst_root, rel) {
+                let _ = std::fs::remove_file(gone);
+            }
+        }
+    }
+    Ok(src)
+}
+
+/// The content hash of one repo-relative file as it stands on disk, `None`
+/// when it does not exist (or the path is unsafe).
+pub fn hash_on_disk(root: &Path, rel: &str) -> Option<String> {
+    let p = safe_join(root, rel).ok()?;
+    std::fs::read(p).ok().map(|b| store::content_hash(&b))
+}
+
+/// The file-level three-way merge decision for landing an isolated thread:
+/// given the thread's head manifest and its base (the fabric snapshot it
+/// branched from), against the LIVE tree at `root`:
+///
+/// * files the thread did not change vs base → not applied (the fabric's
+///   version, whatever it now is, stays);
+/// * files only the thread changed → applied (edits and tombstones alike);
+/// * files changed in BOTH (edit-vs-edit, edit-vs-delete, delete-vs-edit)
+///   where the two sides disagree → **conflicts**; the caller must refuse.
+///
+/// `base: None` (an in-place thread) returns the whole manifest unchanged —
+/// v0.1 semantics.
+pub fn merge_plan(
+    root: &Path,
+    head: &BTreeMap<String, String>,
+    base: Option<&BTreeMap<String, String>>,
+) -> (BTreeMap<String, String>, Vec<String>) {
+    let Some(base) = base else {
+        return (head.clone(), Vec::new());
+    };
+    let mut apply = BTreeMap::new();
+    let mut conflicts = Vec::new();
+    for (rel, h) in head {
+        let base_h = base.get(rel);
+        if base_h == Some(h) {
+            continue; // the thread didn't change it — never overwrite fabric
+        }
+        if base_h.is_none() && h == TOMBSTONE {
+            continue; // created then deleted within the thread — nothing to do
+        }
+        // What the fabric has right now (absence reads as a tombstone).
+        let cur = hash_on_disk(root, rel).unwrap_or_else(|| TOMBSTONE.to_string());
+        if cur == *h {
+            continue; // fabric already agrees with the thread
+        }
+        let fabric_changed = match base_h {
+            Some(b) => cur != *b,
+            None => cur != TOMBSTONE, // not in base; fabric changed iff it exists now
+        };
+        if fabric_changed {
+            conflicts.push(rel.clone());
+        } else {
+            apply.insert(rel.clone(), h.clone());
+        }
+    }
+    (apply, conflicts)
 }
 
 /// How the head manifest differs from what is on disk right now. v1's
@@ -181,8 +325,10 @@ pub fn diff_vs_worktree(root: &Path, manifest: &BTreeMap<String, String>) -> ser
     for (rel, hash) in manifest {
         let Ok(dest) = safe_join(root, rel) else { continue };
         match std::fs::read(&dest) {
+            Ok(_) if hash == TOMBSTONE => changed.push(rel.clone()), // thread deleted it
             Ok(bytes) if store::content_hash(&bytes) == *hash => unchanged += 1,
             Ok(_) => changed.push(rel.clone()),
+            Err(_) if hash == TOMBSTONE => unchanged += 1, // deleted both sides
             Err(_) => added.push(rel.clone()),
         }
     }
@@ -193,8 +339,14 @@ pub fn diff_vs_worktree(root: &Path, manifest: &BTreeMap<String, String>) -> ser
     })
 }
 
-/// Recursive copy skipping [`EXCLUDED_DIRS`] and symlinks.
+/// Recursive copy skipping [`EXCLUDED_DIRS`] (any entry type), symlinks and
+/// `.loomignore` matches.
 pub fn copy_tree(src: &Path, dst: &Path) -> Result<(), String> {
+    let ignore = load_loomignore(src);
+    copy_tree_rec(src, dst, src, &ignore)
+}
+
+fn copy_tree_rec(src: &Path, dst: &Path, root: &Path, ignore: &[String]) -> Result<(), String> {
     std::fs::create_dir_all(dst).map_err(|e| format!("mkdir {}: {e}", dst.display()))?;
     let entries = std::fs::read_dir(src).map_err(|e| format!("read {}: {e}", src.display()))?;
     for entry in entries.flatten() {
@@ -203,19 +355,35 @@ pub fn copy_tree(src: &Path, dst: &Path) -> Result<(), String> {
         let from = entry.path();
         let to = dst.join(&name);
         let Ok(ft) = entry.file_type() else { continue };
-        if ft.is_symlink() {
+        if ft.is_symlink() || EXCLUDED_DIRS.contains(&name_str.as_str()) {
             continue;
         }
-        if ft.is_dir() {
-            if !EXCLUDED_DIRS.contains(&name_str.as_str()) {
-                copy_tree(&from, &to)?;
+        if let Some(rel) = relative_slash(root, &from) {
+            if ignored(ignore, &rel) {
+                continue;
             }
+        }
+        if ft.is_dir() {
+            copy_tree_rec(&from, &to, root, ignore)?;
         } else {
             std::fs::copy(&from, &to)
                 .map_err(|e| format!("copy {}: {e}", from.display()))?;
         }
     }
     Ok(())
+}
+
+/// The per-file snapshot cap: [`MAX_SNAPSHOT_FILE_BYTES`] (8 MiB) unless
+/// the `LOOM_MAX_FILE_MB` env var picks another ceiling (clamped 1–1024).
+/// Larger files are SKIPPED and named in the stitch outcome's `skipped`
+/// list — loom snapshots source, not artifacts; put artifacts in
+/// `.loomignore` instead of raising the cap.
+pub fn max_snapshot_bytes() -> u64 {
+    std::env::var("LOOM_MAX_FILE_MB")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(|mb| mb.clamp(1, 1024) * 1024 * 1024)
+        .unwrap_or(MAX_SNAPSHOT_FILE_BYTES)
 }
 
 /// Run a shell command with a hard timeout, output to temp files (never
@@ -294,7 +462,7 @@ pub fn run_verify(cmd: &str, cwd: &Path, timeout_secs: u64) -> VerifyOutcome {
 
 /// Join a stored relative path under `root`, refusing absolutes, `..` and
 /// backslashes. Stored data never picks paths.
-fn safe_join(root: &Path, rel: &str) -> Result<PathBuf, String> {
+pub(crate) fn safe_join(root: &Path, rel: &str) -> Result<PathBuf, String> {
     if rel.starts_with('/') || rel.contains('\\') {
         return Err(format!("unsafe manifest path {rel:?}"));
     }
@@ -359,6 +527,80 @@ mod tests {
     }
 
     #[test]
+    fn loomignore_extends_the_builtin_excludes_for_capture_and_copy() {
+        let repo = scratch("ign");
+        for (rel, body) in [
+            ("src/keep.rs", "kept"),
+            ("logs/noise.rs", "ignored dir"),
+            ("src/scratch.tmp.rs", "ignored glob"),
+            ("target/debug/junk.rs", "builtin"),
+        ] {
+            let p = repo.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, body).unwrap();
+        }
+        std::fs::write(
+            repo.join(".loomignore"),
+            "# artifacts\nlogs\n**/*.tmp.rs\n../evil\n",
+        )
+        .unwrap();
+        let objects = scratch("ign-obj");
+        let c = capture_scope(&repo, &["**".to_string()], &objects).expect("capture");
+        assert_eq!(
+            c.manifest.keys().cloned().collect::<Vec<_>>(),
+            vec!["src/keep.rs".to_string()],
+            ".loomignore itself, its patterns, and built-ins all excluded"
+        );
+        // The gate's scratch copy honors the same rules.
+        let dst = scratch("ign-copy");
+        copy_tree(&repo, &dst).expect("copy");
+        assert!(dst.join("src/keep.rs").exists());
+        assert!(!dst.join("logs").exists());
+        assert!(!dst.join("src/scratch.tmp.rs").exists());
+        assert!(!dst.join("target").exists());
+    }
+
+    #[test]
+    fn merge_plan_applies_thread_only_changes_and_refuses_both_sided_ones() {
+        let root = scratch("mp");
+        let objects = scratch("mp-obj");
+        let base_hash = store::put_blob(&objects, b"base").unwrap();
+        let thread_hash = store::put_blob(&objects, b"thread").unwrap();
+        std::fs::write(root.join("fabric-moved.txt"), "fabric").unwrap();
+        std::fs::write(root.join("untouched.txt"), "base").unwrap();
+        std::fs::write(root.join("agrees.txt"), "thread").unwrap();
+        std::fs::write(root.join("del-thread.txt"), "base").unwrap();
+        let mut base = BTreeMap::new();
+        for f in [
+            "fabric-moved.txt",
+            "untouched.txt",
+            "agrees.txt",
+            "gone.txt",
+            "del-thread.txt",
+        ] {
+            base.insert(f.to_string(), base_hash.clone());
+        }
+        let mut head = BTreeMap::new();
+        head.insert("fabric-moved.txt".into(), thread_hash.clone()); // both changed → conflict
+        head.insert("untouched.txt".into(), base_hash.clone()); // thread didn't change
+        head.insert("agrees.txt".into(), thread_hash.clone()); // fabric already there
+        head.insert("gone.txt".into(), TOMBSTONE.to_string()); // deleted both sides → no-op
+        head.insert("del-thread.txt".into(), TOMBSTONE.to_string()); // thread-only delete
+        head.insert("new.txt".into(), thread_hash.clone()); // thread-only add
+        let (apply, conflicts) = merge_plan(&root, &head, Some(&base));
+        assert_eq!(conflicts, vec!["fabric-moved.txt".to_string()]);
+        assert_eq!(
+            apply.keys().cloned().collect::<Vec<_>>(),
+            vec!["del-thread.txt".to_string(), "new.txt".to_string()]
+        );
+        assert_eq!(apply["del-thread.txt"], TOMBSTONE);
+        // In-place (no base): the whole manifest applies, v0.1 semantics.
+        let (apply, conflicts) = merge_plan(&root, &head, None);
+        assert_eq!(apply.len(), head.len());
+        assert!(conflicts.is_empty());
+    }
+
+    #[test]
     fn the_gate_is_green_on_true_and_red_on_false_with_a_tail() {
         let repo_dir = scratch("gate");
         std::fs::write(repo_dir.join("f.txt"), "x").unwrap();
@@ -369,6 +611,8 @@ mod tests {
             verify_cmd: cmd.into(),
             git_bridge: false,
             registered_ms: 0,
+            sync_remote: None,
+            auto_sync: false,
         };
         let manifest = BTreeMap::new();
         let green = run_gate(&mk("true"), &manifest, &objects);

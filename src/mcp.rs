@@ -93,8 +93,10 @@ fn tools() -> Value {
             "name": "loom_lease",
             "description": "Declare an intent lease before editing: a one-sentence goal plus \
                 repo-relative path globs (e.g. src/parse/**). Overlap with live leases SUCCEEDS \
-                and returns toe_step warnings — a lease is knowledge, not a lock. Becomes the \
-                current lease for loom_stitch/loom_propose.",
+                and returns toe_step warnings — a lease is knowledge, not a lock. On a git repo \
+                the thread gets its OWN isolated worktree: the response's working_dir is where \
+                you MUST cd and do ALL file edits (the repo tree itself changes only when your \
+                weave lands). Becomes the current lease for loom_stitch/loom_propose.",
             "inputSchema": {"type": "object", "properties": {
                 "goal": {"type": "string", "description": "One sentence: what you are about to do."},
                 "scope": {"type": "array", "items": {"type": "string"},
@@ -103,16 +105,31 @@ fn tools() -> Value {
                              "description": "Acceptance criteria (optional)."},
                 "ttl_ms": {"type": "integer", "description":
                     "Lease TTL in ms (default 30min; clamped 10s–24h). Stitching heartbeats it."},
+                "in_place": {"type": "boolean", "description":
+                    "true = edit the repo tree directly instead of an isolated worktree \
+                     (v0.1 behavior; collisions then only warn)."},
                 "repo": repo_prop,
             }, "required": ["goal", "scope"]},
         },
         {
             "name": "loom_stitch",
-            "description": "Checkpoint the leased scope: the server reads the files itself and \
-                snapshots them content-addressed (you never upload content, and nothing is written \
-                to the repo). Cheap — call every few edits. Also heartbeats the lease.",
+            "description": "Checkpoint the leased scope from the thread's working_dir (its \
+                worktree when isolated): the server reads the files itself and snapshots them \
+                content-addressed, deletions included (you never upload content, and nothing is \
+                written to the repo). Cheap — call every few edits. Also heartbeats the lease.",
             "inputSchema": {"type": "object", "properties": {
                 "lease_id": {"type": "string", "description": "Defaults to the current lease."},
+                "repo": repo_prop,
+            }},
+        },
+        {
+            "name": "loom_rebase",
+            "description": "After a land was refused with 'fabric moved under you': refresh the \
+                thread's worktree from the fabric. Fabric-only changes fast-forward in; files \
+                changed on BOTH sides keep YOUR version and come back as conflicts to review \
+                (the fabric's copy is in the repo tree). Then loom_stitch and loom_propose again.",
+            "inputSchema": {"type": "object", "properties": {
+                "thread_id": {"type": "string", "description": "Defaults to the current thread."},
                 "repo": repo_prop,
             }},
         },
@@ -200,17 +217,59 @@ fn call(engine: &Loom, name: &str, args: &Value) -> Result<String, String> {
                 .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
                 .unwrap_or_default();
             let ttl_ms = args.get("ttl_ms").and_then(|v| v.as_u64());
-            let out = engine.declare_lease(&repo.id, &holder(), goal, scope, criteria, ttl_ms)?;
+            let mode = if args.get("in_place").and_then(|v| v.as_bool()).unwrap_or(false) {
+                loom::IsolationMode::InPlace
+            } else {
+                loom::IsolationMode::Auto
+            };
+            let out = engine
+                .declare_lease_mode(&repo.id, &holder(), goal, scope, criteria, ttl_ms, mode)?;
             solo::set(&engine.base(), &repo.id, &out.lease.id, &out.thread.id);
+            let isolated = out.thread.worktree.is_some();
             Ok(json!({
                 "lease": out.lease,
                 "thread": out.thread,
                 "toe_steps": out.toe_steps,
+                "working_dir": out.working_dir,
+                "working_dir_note": if isolated {
+                    "your isolated worktree — cd there and make ALL edits in it; the repo \
+                     tree changes only when your weave lands"
+                } else {
+                    "no isolation (not a git repo, or in_place requested) — you are editing \
+                     the repo tree directly"
+                },
                 "note": if out.toe_steps.is_empty() {
                     "no toe-steps — the scope is yours to work"
                 } else {
                     "toe-step warnings above: another live lease overlaps your scope; \
                      the lease still succeeded — coordinate or continue"
+                },
+            })
+            .to_string())
+        }
+        "loom_rebase" => {
+            let repo = repo_of(engine, args)?;
+            let thread_id = match arg(args, "thread_id") {
+                Some(t) => t.to_string(),
+                None => solo::get(&engine.base(), &repo.id)
+                    .ok_or("no current thread in this repo — loom_lease first")?
+                    .thread_id,
+            };
+            let out = engine.rebase_thread(&thread_id)?;
+            Ok(json!({
+                "thread": out.thread,
+                "fast_forwarded": out.fast_forwarded,
+                "conflicts": out.conflicts,
+                "note": if out.conflicts.is_empty() {
+                    "rebased clean — loom_stitch, then loom_propose when ready".to_string()
+                } else {
+                    format!(
+                        "CONFLICTS on {} file(s): both the fabric and this thread changed \
+                         them. Your version was kept in the worktree; the fabric's is in \
+                         the repo tree. Reconcile in the worktree, then loom_stitch and \
+                         loom_propose.",
+                        out.conflicts.len()
+                    )
                 },
             })
             .to_string())
@@ -267,12 +326,28 @@ fn call(engine: &Loom, name: &str, args: &Value) -> Result<String, String> {
         }
         "loom_adopt" => {
             let thread_id = arg(args, "thread_id").ok_or("loom_adopt needs a thread_id")?;
-            let (thread, lease) = engine.adopt(thread_id, &holder())?;
+            // Local first; unknown + a sync remote → the cross-machine
+            // claims flow (first CAS push wins; losing names the winner).
+            let (thread, lease) = match engine.adopt(thread_id, &holder()) {
+                Ok(pair) => pair,
+                Err(e) if e.contains("no thread with id") => {
+                    let repo = repo_of(engine, args)?;
+                    if repo.sync_remote.is_some() {
+                        loom::sync::adopt_remote(engine, &repo.id, thread_id, &holder())?
+                    } else {
+                        return Err(e);
+                    }
+                }
+                Err(e) => return Err(e),
+            };
             solo::set(&engine.base(), &thread.repo_id, &lease.id, &thread.id);
+            let working_dir = thread.worktree.clone();
             Ok(json!({
                 "thread": thread,
                 "lease": lease,
-                "note": "you inherited the goal, criteria and scope; continue from the last stitch",
+                "working_dir": working_dir,
+                "note": "you inherited the goal, criteria and scope; the last stitch is \
+                         materialized in working_dir (when set) — cd there and continue",
             })
             .to_string())
         }
