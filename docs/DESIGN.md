@@ -32,6 +32,19 @@ coordination layer that sits above git: agents live in Heddle; Heddle projects
 its history down into ordinary git commits so every existing tool, host, and
 habit keeps working.
 
+None of the diagnosis above is unique to this design. Several projects have
+converged on worktree isolation plus gated merging — daemon-run hierarchical
+teams (batty), web control planes with dispatch and merge stewards
+(stoneforge), coordination servers with file locks and presence (aweb),
+forge-label orchestration (rjwalters/loom), single-agent delivery harnesses
+(valkor-ai/loom). That convergence is evidence the problem is real, and this
+document claims none of those pieces as its own. What it does claim as its
+distinct core is the combination delivered without a platform: leaderless,
+warn-only intent leases; an always-green fabric advanced only by
+compare-and-swap over bare git remotes; decentralized orphan adoption; and
+stitch-level history — a serverless, git-native protocol and one binary. The
+README's "Adjacent projects" section places each neighbor precisely.
+
 ## The six ideas
 
 ### 1. Worktree isolation — a tree per task
