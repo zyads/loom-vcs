@@ -67,6 +67,16 @@ An honest concession: two careful humans working slowly don't need this. The
 value scales with writer count and edit frequency — it exists for fleets of
 agents (and humans who work like them).
 
+Heddle is not alone in this space. Several projects have converged on
+worktree isolation + gated merging — that convergence is evidence the
+problem is real. What Heddle claims as its own is narrower and specific:
+**leaderless, warn-only intent leases** (no dispatcher, no locks), an
+**always-green fabric advanced only by compare-and-swap over bare git
+remotes** (no server), **decentralized orphan adoption**, and
+**stitch-level history** — a serverless, git-native *protocol* and one
+binary, not a platform. See [Adjacent projects](#adjacent-projects) for the
+neighbors and what each does that Heddle doesn't.
+
 ## What it's not for
 
 - **N agents racing the SAME task.** Heddle coordinates *different* tasks on
@@ -272,6 +282,8 @@ the same per-thread branch — review an agent's in-flight work with plain
 
 ## Comparison
 
+Against the substrates Heddle builds on or replaces the workflow of:
+
 | | git worktrees alone | Jujutsu | CI-gated trunk | Heddle |
 |---|---|---|---|---|
 | Per-task isolation | yes | yes (working-copy commits) | no | yes (worktree per thread) |
@@ -282,6 +294,45 @@ the same per-thread branch — review an agent's in-flight work with plain
 | Agent-native interface (MCP) | no | no | no | yes |
 | Multi-machine without new infra | via remotes, manual | via git remotes, manual | server | any shared git remote (`heddle sync`) |
 | Is your git history | yes | yes | yes | yes (bridge: squash, per-checkpoint, or both — never pushed) |
+
+Against the adjacent agent-coordination projects (see
+[Adjacent projects](#adjacent-projects) for links; claims below are from
+their own docs as of July 2026):
+
+| | what it is | needs a server / control plane? | coordination style | multi-machine without new infra? | always-green invariant? | crash-recovery semantics |
+|---|---|---|---|---|---|---|
+| aweb | platform (coordination server + identity registry) | yes — server (FastAPI/Postgres/Redis) plus `awid` identity service | mail, chat, tasks, roles, presence, **file locks**; MCP tools | yes, but through its server (team certificates) | not documented | not documented |
+| batty | platform (Rust daemon driving tmux agent teams) | yes — persistent daemon | hierarchical dispatch: architects plan, managers route, engineers execute — each engineer in its own worktree | single host (daemon + tmux) | yes — daemon auto-tests completions and merges on green; no agent in the merge path | crash respawn, stall detection (all roles), auto-restart |
+| stoneforge | platform (TypeScript web control plane) | yes — local server + web dashboard | dispatch daemon assigns dependency-ordered tasks; Director / Worker / Steward roles; worktree per worker | not addressed — local orchestration | merge steward runs your test command, squash-merges on pass, hands failures to a new worker | event-sourced log; session resumption not yet implemented |
+| valkor-ai/loom | delivery harness (local MCP state machine for one agent) | no | single-agent plan → build → test → fix loop; not multi-agent coordination | n/a (per-machine, per-project) | review/repair loop with recorded evidence; no hard merge block | state saved under `.loom/`; resume with `/loom continue` |
+| Heddle | protocol + one binary on top of git | no — state lives in your repo and any ordinary git remote | leaderless, **warn-only** intent leases; no dispatcher, no locks | yes — any shared git remote (`heddle sync`) | yes — verify in a scratch copy + consent gate; fabric advances only by CAS ref push | orphans: goal, criteria, seconds-old checkpoint attached; adoptable cross-machine, first CAS claim wins |
+
+Read the columns honestly: the platforms above do things Heddle deliberately
+does not — orchestration, role hierarchies, task boards, chat, presence,
+automated dispatch. Heddle only coordinates writers and keeps the shared
+line green.
+
+## Adjacent projects
+
+- [aweb](https://github.com/awebai/aweb) — a team-coordination platform for
+  agents: mail, chat, tasks, file locks, presence, and roles behind a server
+  and an identity registry.
+- [batty](https://github.com/battysh/batty) — a Rust daemon that runs
+  hierarchical agent teams in tmux, with a worktree per engineer and a
+  verify-then-auto-merge loop that keeps agents out of the merge path.
+- [stoneforge](https://github.com/stoneforge-ai/stoneforge) — a TypeScript
+  web control plane with Director/Worker/Steward roles, a dispatch daemon,
+  worktree isolation, and test-gated merge review.
+- [valkor-ai/loom](https://github.com/valkor-ai/loom) — a delivery harness
+  that keeps a single agent on track through a multi-step task (plan, build,
+  test, fix) with resumable state between sessions.
+- [rjwalters/loom](https://github.com/rjwalters/loom) — orchestration that
+  uses your git forge as the coordination layer, driving agents through
+  labels on issues and PRs.
+
+Heddle is deliberately the thin layer: a protocol and a binary, not a
+platform. If you want orchestration on top, these are good; Heddle aims to
+be what they could coordinate through.
 
 ## License
 
