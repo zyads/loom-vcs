@@ -48,9 +48,12 @@
 //!   nothing was applied."* A refusal leaves the working tree untouched with
 //!   the reason noted on the thread.
 //! * **The git bridge never pushes.** When a repo was registered with
-//!   `git_bridge: true`, a landed weave becomes one local commit on the
-//!   current branch, message composed from the lease goal + criteria +
-//!   verify result. Per-thread draft-branch export is future work.
+//!   `git_bridge: true`, a landed weave projects into local git history at
+//!   the repo's configured granularity ([`BridgeMode`]): `squash` (one
+//!   commit per weave — the default), `stitches` (checkpoint commits on a
+//!   per-thread branch, merged with the weave message), or `both` (squash
+//!   plus the branch kept unmerged). `loom export` writes an unlanded
+//!   thread's stitch chain to its per-thread branch for human review.
 //! * **Sync is explicit and says what it shares.** `loom sync` publishes
 //!   lease/thread metadata AND scoped file blobs to the configured remote —
 //!   the same exposure as pushing a branch there; `--auto` is a per-repo
@@ -118,6 +121,52 @@ pub const MAX_TOE_STEPS: usize = 100;
 // per object, serde-defaulted, once a per-machine key signs them.
 // ---------------------------------------------------------------------------
 
+/// How the git bridge projects a landed weave into git history.
+/// One lease = one goal = one commit is the intended granularity — scope
+/// leases small and `Squash` reads like a clean semantic log. The other
+/// modes exist for teams who want checkpoint-level history in git itself.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BridgeMode {
+    /// One commit per weave on the current branch (goal + criteria +
+    /// verify). The default.
+    #[default]
+    Squash,
+    /// Replay the thread's stitch chain as individual commits on a
+    /// per-thread branch `loom/<thread-id-short>-<goal-slug>`, then merge
+    /// that branch into the current branch with a merge commit carrying the
+    /// weave message. History shows every checkpoint AND the semantic
+    /// landing.
+    Stitches,
+    /// Squash commit on the current branch + the per-thread branch
+    /// preserved (not merged) for archaeology.
+    Both,
+}
+
+impl BridgeMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Squash => "squash",
+            Self::Stitches => "stitches",
+            Self::Both => "both",
+        }
+    }
+}
+
+impl std::str::FromStr for BridgeMode {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "squash" => Ok(Self::Squash),
+            "stitches" => Ok(Self::Stitches),
+            "both" => Ok(Self::Both),
+            other => Err(format!(
+                "unknown bridge mode '{other}' — pick squash | stitches | both"
+            )),
+        }
+    }
+}
+
 /// A registered loom repo: a directory the operator pointed Loom at.
 /// `id` is a stable hash of the canonical path, so re-registering the same
 /// directory is idempotent.
@@ -131,6 +180,10 @@ pub struct RepoConfig {
     /// When true, a landed weave becomes one local git commit (never a push).
     #[serde(default)]
     pub git_bridge: bool,
+    /// Granularity of what the bridge commits ([`BridgeMode`]); serde-default
+    /// so state files written before this field existed load as `Squash`.
+    #[serde(default)]
+    pub bridge_mode: BridgeMode,
     pub registered_ms: u64,
     /// The git remote `loom sync` talks to, remembered from the first
     /// `loom sync --remote <name>`. `None` = this repo has never synced.
@@ -480,7 +533,11 @@ pub struct ProposeOutcome {
 }
 
 /// What `land_weave` hands back so the caller can run the git bridge and
-/// speak honestly about what changed.
+/// speak honestly about what changed. `stitches` is the thread's stitch
+/// chain oldest-first (what `stitches`/`both` bridge modes replay),
+/// `base_manifest` the thread's base snapshot (empty for in-place threads),
+/// and `objects_dir` the repo's blob store — everything the bridge needs
+/// without touching engine state again.
 #[derive(Clone, Debug)]
 pub struct LandOutcome {
     pub repo: RepoConfig,
@@ -488,6 +545,18 @@ pub struct LandOutcome {
     pub weave: Weave,
     pub criteria: Vec<String>,
     pub files_applied: usize,
+    pub stitches: Vec<Stitch>,
+    pub base_manifest: BTreeMap<String, String>,
+    pub objects_dir: PathBuf,
+}
+
+/// What `export_thread` hands back: the per-thread branch written (or
+/// refreshed) and how many stitch commits it carries.
+#[derive(Clone, Debug)]
+pub struct ExportOutcome {
+    pub thread: Thread,
+    pub branch: String,
+    pub commits: usize,
 }
 
 impl Loom {
@@ -564,6 +633,7 @@ impl Loom {
                 path: canon_str.clone(),
                 verify_cmd: cmd.clone(),
                 git_bridge,
+                bridge_mode: BridgeMode::default(),
                 registered_ms: now_ms(),
                 sync_remote: None,
                 auto_sync: false,
@@ -578,6 +648,29 @@ impl Loom {
                 &serde_json::json!({
                     "ts_ms": now_ms(), "kind": "repo_registered",
                     "path": canon_str, "verify_cmd": cmd, "git_bridge": git_bridge,
+                }),
+            );
+            Ok(repo)
+        })
+    }
+
+    /// Set how the git bridge projects landed weaves into git history
+    /// (`loom init --bridge-mode <mode>` / `loom config --bridge-mode
+    /// <mode>`). Re-registering a repo keeps the stored mode.
+    pub fn set_bridge_mode(&self, repo_id: &str, mode: BridgeMode) -> Result<RepoConfig, String> {
+        self.with(|s, base| {
+            let repo = s
+                .repos
+                .iter_mut()
+                .find(|r| r.id == repo_id)
+                .ok_or_else(|| format!("no registered repo with id {repo_id}"))?;
+            repo.bridge_mode = mode;
+            let repo = repo.clone();
+            store::append_event(
+                base,
+                repo_id,
+                &serde_json::json!({
+                    "ts_ms": now_ms(), "kind": "bridge_mode_set", "mode": mode.as_str(),
                 }),
             );
             Ok(repo)
@@ -1368,12 +1461,17 @@ impl Loom {
                 .map(|t| (t.head_stitch.clone(), t.base_stitch.clone()))
                 .ok_or_else(|| format!("thread {} vanished", weave.thread_id))?;
             let manifest = head_id
-                .and_then(|id| rs.stitches.iter().find(|st| st.id == id))
+                .as_ref()
+                .and_then(|id| rs.stitches.iter().find(|st| st.id == *id))
                 .map(|st| st.files.clone())
                 .ok_or_else(|| "thread's stitches are gone; cannot apply".to_string())?;
             let base_manifest = base_id
                 .and_then(|id| rs.stitches.iter().find(|st| st.id == id))
                 .map(|st| st.files.clone());
+            // The stitch chain oldest-first, for bridge modes that replay
+            // checkpoints. Pruned parents just end the walk — honest partial
+            // history beats none.
+            let stitch_chain = stitch_chain(rs, head_id.as_ref());
             // Isolated threads MERGE at file level: only files the thread
             // actually changed vs its base are applied, and a file that
             // moved in BOTH the fabric and the thread refuses the land —
@@ -1449,6 +1547,9 @@ impl Loom {
                 weave,
                 criteria,
                 files_applied: applied,
+                stitches: stitch_chain,
+                base_manifest: base_manifest.unwrap_or_default(),
+                objects_dir: objects,
             })
         })
     }
@@ -2173,6 +2274,88 @@ impl Loom {
             "diff_vs_fabric": diff,
         }))
     }
+
+    // -- draft-branch export -------------------------------------------------
+
+    /// Write a thread's stitch chain to its per-thread git branch
+    /// (`loom/<thread-id-short>-<goal-slug>`) WITHOUT landing anything —
+    /// draft-branch export for human review of in-flight (Active/Proposed)
+    /// work; woven and orphaned threads export too, for archaeology.
+    /// Rebuilds the branch from the current branch tip on every call —
+    /// export is a projection, not state. Pure git plumbing: the working
+    /// tree, index and current branch are never touched. Blocking (git
+    /// subprocesses); call from a blocking-task helper on async paths.
+    pub fn export_thread(&self, thread_id: &str) -> Result<ExportOutcome, String> {
+        // Phase 1 (locked): gather the chain and base.
+        let (repo, thread, stitches, base_manifest) = self.with(|s, base| {
+            let repo_id = find_repo_of_thread(s, thread_id)
+                .ok_or_else(|| format!("no thread with id {thread_id}"))?;
+            reconcile_repo(s, &repo_id, now_ms(), base);
+            let repo = s
+                .repos
+                .iter()
+                .find(|r| r.id == repo_id)
+                .cloned()
+                .ok_or_else(|| format!("repo {repo_id} vanished from the registry"))?;
+            let rs = s.repo_states.get(&repo_id).expect("repo state exists");
+            let thread = rs
+                .threads
+                .iter()
+                .find(|t| t.id == thread_id)
+                .cloned()
+                .expect("found above");
+            let chain = stitch_chain(rs, thread.head_stitch.as_ref());
+            if chain.is_empty() {
+                return Err("nothing to export — capture a stitch first".to_string());
+            }
+            let base_manifest = thread
+                .base_stitch
+                .as_ref()
+                .and_then(|id| rs.stitches.iter().find(|st| st.id == *id))
+                .map(|st| st.files.clone())
+                .unwrap_or_default();
+            Ok((repo, thread, chain, base_manifest))
+        })?;
+        if !worktree::is_git_repo(std::path::Path::new(&repo.path)) {
+            return Err(format!("{} is not a git repo — nothing to export to", repo.path));
+        }
+        // Phase 2 (unlocked): replay the chain onto the branch, plumbing only.
+        let repo_dir = std::path::Path::new(&repo.path);
+        let objects = store::objects_dir(&self.base(), &repo.id);
+        let base_commit = bridge::head_commit(repo_dir)?;
+        let branch = bridge::thread_branch_name(&thread.id, &thread.goal);
+        let commits = bridge::build_thread_branch(
+            repo_dir,
+            &base_commit,
+            &branch,
+            &thread.goal,
+            &stitches,
+            &base_manifest,
+            &objects,
+        )?;
+        if commits == 0 {
+            return Err(
+                "every stitch in the chain was an empty diff — nothing to export".to_string(),
+            );
+        }
+        // Phase 3 (locked): log it.
+        self.with(|s, base| {
+            let _ = s; // state unchanged — export is a projection
+            store::append_event(
+                base,
+                &repo.id,
+                &serde_json::json!({
+                    "ts_ms": now_ms(), "kind": "exported", "thread": thread_id,
+                    "branch": branch, "commits": commits,
+                }),
+            );
+        });
+        Ok(ExportOutcome {
+            thread,
+            branch,
+            commits,
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2208,6 +2391,24 @@ fn reconcile_repo(s: &mut LoomState, repo_id: &str, now: u64, base: &PathBuf) {
         // The lease record is KEPT (goal/criteria/scope ride along for the
         // adopter); it just no longer counts as live anywhere.
     }
+}
+
+/// A thread's stitch chain, oldest first, walked from `head` through
+/// `parent` links. A pruned parent ends the walk. The thread's base stitch
+/// (worktree snapshot) is never in this chain — it has no parent link from
+/// the first real stitch.
+fn stitch_chain(rs: &RepoState, head: Option<&String>) -> Vec<Stitch> {
+    let mut chain = Vec::new();
+    let mut cur = head.cloned();
+    while let Some(id) = cur {
+        let Some(st) = rs.stitches.iter().find(|s| s.id == id) else {
+            break;
+        };
+        chain.push(st.clone());
+        cur = st.parent.clone();
+    }
+    chain.reverse();
+    chain
 }
 
 fn find_repo_of_lease(s: &LoomState, lease_id: &str) -> Option<String> {

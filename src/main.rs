@@ -4,8 +4,9 @@
 //! The standalone `loom` binary — solo/CLI front-end over the engine in
 //! `lib.rs`, plus `loom mcp`, a stdio MCP server for agent sessions.
 //!
-//! Verbs: `init · lease · stitch · propose · withdraw · adopt · status ·
-//! log · mcp`. State lives under `~/.loom` (override with `LOOM_DATA`).
+//! Verbs: `init · config · lease · stitch · propose · export · withdraw ·
+//! adopt · status · log · mcp`. State lives under `~/.loom` (override with
+//! `LOOM_DATA`).
 //! The current lease per repo is remembered in a solo-mode pointer
 //! (`solo.json`) so `stitch`/`propose`/`withdraw` need no ids.
 //!
@@ -26,12 +27,19 @@ loom — version control for many hands moving at once (docs/DESIGN.md)
 
 usage:
   loom init [--verify CMD] [--git-bridge]     register the current directory
+       [--bridge-mode squash|stitches|both]   (bridge granularity; default
+                                              squash — one commit per weave)
+  loom config [--bridge-mode MODE]            show this repo's config, or set
+                                              the git-bridge granularity
   loom lease \"<goal>\" <scope...>              declare an intent lease; on a git
        [--criteria TEXT]... [--ttl-ms N]      repo the thread gets its OWN
        [--isolated | --in-place]              worktree — edit there
   loom stitch [--lease ID]                    checkpoint the leased scope
   loom propose [--thread ID]                  verify in a scratch copy; green
                                               asks you before applying
+  loom export [--thread ID]                   write the thread's stitch chain to
+                                              its draft branch loom/<id>-<goal>
+                                              for review — nothing lands
   loom rebase [--thread ID]                   refresh the thread's worktree from
                                               the fabric (after \"fabric moved\")
   loom withdraw                               return a proposed thread to active
@@ -57,9 +65,11 @@ fn main() -> ExitCode {
     let rest = &args[1..];
     let out = match verb {
         "init" => cmd_init(rest),
+        "config" => cmd_config(rest),
         "lease" => cmd_lease(rest),
         "stitch" => cmd_stitch(rest),
         "propose" => cmd_propose(rest),
+        "export" => cmd_export(rest),
         "rebase" => cmd_rebase(rest),
         "withdraw" => cmd_withdraw(),
         "adopt" => cmd_adopt(rest),
@@ -166,6 +176,7 @@ fn target(
 fn cmd_init(rest: &[String]) -> Result<(), String> {
     let mut verify = None;
     let mut git_bridge = false;
+    let mut bridge_mode = None;
     let mut it = rest.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -177,22 +188,104 @@ fn cmd_init(rest: &[String]) -> Result<(), String> {
                 )
             }
             "--git-bridge" => git_bridge = true,
+            "--bridge-mode" => {
+                let v = it
+                    .next()
+                    .ok_or_else(|| "--bridge-mode needs squash | stitches | both".to_string())?;
+                bridge_mode = Some(v.parse::<loom::BridgeMode>()?);
+            }
             other => return Err(format!("unknown init flag '{other}'")),
         }
     }
     let engine = store();
-    let repo = engine.register_repo(".", verify, git_bridge)?;
+    let mut repo = engine.register_repo(".", verify, git_bridge)?;
+    if let Some(mode) = bridge_mode {
+        repo = engine.set_bridge_mode(&repo.id, mode)?;
+    }
     println!("registered {} as {}", repo.path, repo.id);
     println!("  verify:     {}", repo.verify_cmd);
-    println!(
-        "  git bridge: {}",
-        if repo.git_bridge {
-            "on — one local commit per landed weave (never a push)"
-        } else {
-            "off"
-        }
-    );
+    println!("  git bridge: {}", bridge_line(&repo));
     println!("  data:       {}", engine.base().display());
+    Ok(())
+}
+
+/// One honest line about what the bridge will do for this repo.
+fn bridge_line(repo: &RepoConfig) -> String {
+    if !repo.git_bridge {
+        return format!(
+            "off (bridge mode {} takes effect when the bridge is on)",
+            repo.bridge_mode.as_str()
+        );
+    }
+    match repo.bridge_mode {
+        loom::BridgeMode::Squash => {
+            "on, squash — one local commit per landed weave (never a push)".into()
+        }
+        loom::BridgeMode::Stitches => {
+            "on, stitches — checkpoint commits on a loom/<thread> branch, \
+             merged with the weave message (never a push)"
+                .into()
+        }
+        loom::BridgeMode::Both => {
+            "on, both — squash commit + the loom/<thread> branch kept \
+             unmerged (never a push)"
+                .into()
+        }
+    }
+}
+
+fn cmd_config(rest: &[String]) -> Result<(), String> {
+    let mut bridge_mode = None;
+    let mut it = rest.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--bridge-mode" => {
+                let v = it
+                    .next()
+                    .ok_or_else(|| "--bridge-mode needs squash | stitches | both".to_string())?;
+                bridge_mode = Some(v.parse::<loom::BridgeMode>()?);
+            }
+            other => return Err(format!("unknown config flag '{other}'")),
+        }
+    }
+    let engine = store();
+    let mut repo = current_repo(engine)?;
+    if let Some(mode) = bridge_mode {
+        repo = engine.set_bridge_mode(&repo.id, mode)?;
+        println!("bridge mode set to {}", repo.bridge_mode.as_str());
+    }
+    println!("repo {} ({})", repo.id, repo.path);
+    println!("  verify:      {}", repo.verify_cmd);
+    println!("  git bridge:  {}", bridge_line(&repo));
+    println!(
+        "  sync:        {}{}",
+        repo.sync_remote.as_deref().unwrap_or("(no remote configured)"),
+        if repo.auto_sync { ", auto" } else { "" }
+    );
+    Ok(())
+}
+
+fn cmd_export(rest: &[String]) -> Result<(), String> {
+    let engine = store();
+    let repo = current_repo(engine)?;
+    // Explicit --thread wins; otherwise the solo pointer's thread. Unlike
+    // stitch/propose this never needs a live lease — woven and orphaned
+    // threads export too.
+    let thread_id = match flag_value(rest, "--thread")? {
+        Some(id) => id,
+        None => current_pointer(engine).map(|(_, ptr)| ptr.thread_id).map_err(|_| {
+            "no current thread — `loom export --thread <id>` (see `loom status`)".to_string()
+        })?,
+    };
+    let _ = repo;
+    let out = engine.export_thread(&thread_id)?;
+    println!(
+        "exported {} stitch commit(s) to branch {}",
+        out.commits, out.branch
+    );
+    println!("  goal: {}", out.thread.goal);
+    println!("  review with: git log -p {}", out.branch);
+    println!("  nothing landed — the working tree and current branch are untouched");
     Ok(())
 }
 
@@ -527,7 +620,15 @@ fn cmd_status() -> Result<(), String> {
         .unwrap_or_default();
     let ptr = solo::get(&engine.base(), &repo.id);
     println!("repo {} ({})", repo.id, repo.path);
-    println!("  verify: {}   git bridge: {}", repo.verify_cmd, repo.git_bridge);
+    println!(
+        "  verify: {}   git bridge: {}",
+        repo.verify_cmd,
+        if repo.git_bridge {
+            format!("on ({})", repo.bridge_mode.as_str())
+        } else {
+            "off".to_string()
+        }
+    );
     println!(
         "  fabric: {} ({} weaves landed — every one verified green)",
         rs.fabric.tip.as_deref().unwrap_or("empty"),

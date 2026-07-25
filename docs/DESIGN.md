@@ -81,10 +81,15 @@ machine gets a fresh worktree with its last stitch materialized. Abrupt
 death is a normal, recoverable state of work.
 
 ### 6. The git bridge — meet every developer where they live
-The fabric exports to plain git: one local commit per landed weave, message
-composed from goal + criteria + verify result. Never a push. Humans keep
-GitHub, `git log`, bisect, blame; agents keep stitches, leases, and sync.
-Per-thread draft-branch export (`loom export`) is future work.
+The fabric exports to plain git at a per-repo granularity (`bridge_mode`):
+`squash` (default) — one local commit per landed weave, message composed
+from goal + criteria + verify result; `stitches` — the thread's checkpoint
+chain replays as commits on a `loom/<thread>-<goal>` branch (temp-index
+plumbing, never the working tree), merged with the weave message; `both` —
+squash plus the branch kept unmerged. Never a push, in any mode. Humans
+keep GitHub, `git log`, bisect, blame; agents keep stitches, leases, and
+sync. `loom export` writes an UNLANDED thread's chain to the same branch
+for human review of in-flight work.
 
 ## Exact merge semantics (isolated threads)
 
@@ -257,13 +262,13 @@ content-addressed whole-file blobs under `~/.loom` (override `LOOM_DATA`),
 - `sync.rs`: the multi-machine layer above — state refs, CAS fabric,
   claims, mailbox — implemented over the repo's own `git` binary; the
   engine never shells git itself.
-- `loom` CLI: `init · lease · stitch · propose · rebase · withdraw · adopt ·
-  clean · sync · status · log · mcp`, with `--lease/--thread` overrides for
-  multi-seat terminals.
+- `loom` CLI: `init · config · lease · stitch · propose · export · rebase ·
+  withdraw · adopt · clean · sync · status · log · mcp`, with
+  `--lease/--thread` overrides for multi-seat terminals.
 - `loom mcp`: stdio MCP server — `loom_status · loom_lease · loom_stitch ·
   loom_propose · loom_rebase · loom_adopt`. Proposing verifies; landing
   always requires the human path.
 - **Not yet**, honestly: signatures; gossip without a blessed remote;
   rolling-hash chunking (whole-file snapshots dedup by sha256); per-slice
-  test impact (verify is whole-repo); draft-branch export; gitignore
-  parsing beyond `.loomignore`.
+  test impact (verify is whole-repo); gitignore parsing beyond
+  `.loomignore`.

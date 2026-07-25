@@ -67,8 +67,9 @@ agents (and humans who work like them).
   one repo. For redundant attempts at one task, use a judge/tournament
   harness — then lease the winner's landing.
 - **Replacing git.** Loom sits on top; git stays your history, remotes, and
-  review tooling. The optional bridge turns each landed weave into one local
-  commit (never a push).
+  review tooling. The optional bridge projects each landed weave into local
+  git history — one commit per weave by default, checkpoint-level if you ask
+  (see `bridge_mode` below) — and never pushes.
 - **Humans doing normal PRs.** Slow, coordinated-out-of-band work is what
   git+GitHub already does well.
 
@@ -225,11 +226,34 @@ Loom's answer, point by point:
 - **Verify is whole-repo, in a scratch copy, with a hard timeout.** Red never
   lands; a gate that can't even stage its check reports red, not silence.
 
+## Git history granularity (`bridge_mode`)
+
+The philosophy: **one lease = one goal = one commit.** Scope leases small and
+the bridge's default gives you a semantic git log where every commit is a
+goal that verified green. `bridge_mode` exists for teams who want
+checkpoint-level history in git itself — set it at `loom init --bridge-mode
+<mode>` or later with `loom config --bridge-mode <mode>`:
+
+| mode | what lands in git | one-line guidance |
+|---|---|---|
+| `squash` (default) | one commit per weave: goal + criteria + verify | scope leases small; keep the log semantic |
+| `stitches` | every checkpoint as a commit on a `loom/<thread>-<goal>` branch, then a merge commit carrying the weave message | you want checkpoint-level `git bisect`/review without losing the semantic landing |
+| `both` | the squash commit + the per-thread branch preserved, unmerged | clean mainline log, archaeology on the side |
+
+Checkpoint replay is pure git plumbing (a temporary index; `read-tree` →
+`hash-object` → `update-index` → `write-tree` → `commit-tree`) — it never
+touches your working tree, real index, or current branch; empty-diff
+checkpoints are skipped. Nothing is ever pushed, in any mode.
+
+`loom export [--thread <id>]` writes an **unlanded** thread's checkpoints to
+the same per-thread branch — review an agent's in-flight work with plain
+`git log -p loom/<thread>-<goal>`; nothing lands, nothing moves.
+
 ## Scale ladder
 
 | rung | status |
 |---|---|
-| Several agents, one machine | shipped — worktree isolation, leases, green gate, orphans (39 tests) |
+| Several agents, one machine | shipped — worktree isolation, leases, green gate, orphans, configurable git bridge + draft-branch export (45 tests) |
 | A few people/machines, one shared git remote | shipped — `loom sync`: state over `refs/loom/*`, CAS fabric ref, cross-machine adoption claims; metadata is unsigned (machine ids are identity, not authentication) |
 | Team knobs (consent dials, envelopes) | exists in the Aether integration, which embeds this crate; the generic mailbox namespace here is the hook it rides on |
 | Many peers, no blessed remote (gossip) | design only — see [docs/DESIGN.md](docs/DESIGN.md), "Federation" |
@@ -245,7 +269,7 @@ Loom's answer, point by point:
 | Crashed work is claimable with its goal attached | no | no | no | yes (orphans + adoption) |
 | Agent-native interface (MCP) | no | no | no | yes |
 | Multi-machine without new infra | via remotes, manual | via git remotes, manual | server | any shared git remote (`loom sync`) |
-| Is your git history | yes | yes | yes | yes (bridge: one commit per weave, never pushed) |
+| Is your git history | yes | yes | yes | yes (bridge: squash, per-checkpoint, or both — never pushed) |
 
 ## License
 

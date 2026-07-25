@@ -390,7 +390,15 @@ pub fn max_snapshot_bytes() -> u64 {
 /// pipes — a full pipe buffer would deadlock a chatty build). Returns the
 /// outcome with a bounded log tail. Also used by the git bridge.
 pub fn run_verify(cmd: &str, cwd: &Path, timeout_secs: u64) -> VerifyOutcome {
-    let log_path = cwd.join(".loom-verify.log");
+    // The log lives OUTSIDE `cwd`: the git bridge runs `git add -A` through
+    // here, and a log file inside the tree would be staged into the commit.
+    static LOG_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let log_path = std::env::temp_dir().join(format!(
+        "loom-verify-{}-{}-{}.log",
+        std::process::id(),
+        now_ms(),
+        LOG_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
     let red = |tail: String| VerifyOutcome {
         cmd: cmd.to_string(),
         result: VerifyResult::Red,
@@ -610,6 +618,7 @@ mod tests {
             path: repo_dir.to_string_lossy().to_string(),
             verify_cmd: cmd.into(),
             git_bridge: false,
+            bridge_mode: Default::default(),
             registered_ms: 0,
             sync_remote: None,
             auto_sync: false,
