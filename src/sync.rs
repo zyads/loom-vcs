@@ -320,6 +320,17 @@ pub fn sync(
     remote: Option<&str>,
     auto: Option<bool>,
 ) -> Result<SyncOutcome, String> {
+    sync_opts(engine, repo_id, remote, auto, false)
+}
+
+/// [`sync`], plus the escape hatch for publishing to a remote anyone can read.
+pub fn sync_opts(
+    engine: &Heddle,
+    repo_id: &str,
+    remote: Option<&str>,
+    auto: Option<bool>,
+    allow_public: bool,
+) -> Result<SyncOutcome, String> {
     let repo = if remote.is_some() || auto.is_some() {
         engine.set_sync(repo_id, remote.map(String::from), auto)?
     } else {
@@ -337,6 +348,17 @@ pub fn sync(
     let repo_path = PathBuf::from(&repo.path);
     if !worktree::is_git_repo(&repo_path) {
         return Err("sync needs a git repo (the remote rides ordinary git refs)".into());
+    }
+    // Sync publishes the *content* of leased files so another machine can see
+    // work in progress. On a repo the world can read, that is unfinished
+    // source in public. Refuse rather than surprise someone.
+    if !allow_public && repo.auto_sync && remote_is_world_readable(&repo_path, &remote) == Some(true) {
+        return Err(format!(
+            "'{remote}' can be read by anyone without signing in, and sync publishes the \
+             contents of leased files there — that would put work in progress in public. \
+             Turn it off with `heddle sync --auto off`, point sync at a private remote, or \
+             pass --anyway if you really mean to publish it."
+        ));
     }
     let machine = machine_id(&engine.base());
     let mut out = SyncOutcome {
@@ -1061,5 +1083,122 @@ mod tests {
         // In-place lease on a machine, isolated modes etc. are covered in
         // lib tests; here the point is the claim decided the race.
         let _ = IsolationMode::Auto;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Is this remote readable by the whole world?
+// ---------------------------------------------------------------------------
+
+/// Turn a remote URL into the address an anonymous stranger would use, or
+/// `None` when we cannot tell (a local path, an unfamiliar scheme).
+///
+/// `git@github.com:owner/repo.git` and `https://user@github.com/owner/repo`
+/// both become `https://github.com/owner/repo.git`.
+pub fn anonymous_url(url: &str) -> Option<String> {
+    let u = url.trim();
+    if u.is_empty() || u.starts_with('/') || u.starts_with('.') || u.starts_with("file:") {
+        return None;
+    }
+    // scp-like: [user@]host:path
+    if !u.contains("://") {
+        let (hostpart, path) = u.split_once(':')?;
+        let host = hostpart.rsplit('@').next()?;
+        if host.is_empty() || path.is_empty() {
+            return None;
+        }
+        return Some(format!("https://{host}/{}", path.trim_start_matches('/')));
+    }
+    let (scheme, rest) = u.split_once("://")?;
+    if !matches!(scheme, "https" | "http" | "ssh" | "git") {
+        return None;
+    }
+    let (hostpart, path) = rest.split_once('/')?;
+    let host = hostpart.rsplit('@').next()?; // drop any userinfo
+    if host.is_empty() || path.is_empty() {
+        return None;
+    }
+    Some(format!("https://{host}/{path}"))
+}
+
+/// Ask the remote **with every credential path shut off**. If it still answers,
+/// anybody can read it — which means anybody can read the file content sync
+/// publishes there.
+///
+/// `None` means "could not tell" (offline, unfamiliar URL). A caller must treat
+/// that as unknown rather than as safe.
+pub fn remote_is_world_readable(repo: &Path, remote_name: &str) -> Option<bool> {
+    let url = String::from_utf8(
+        run_git(repo, &["remote", "get-url", remote_name], None).ok()?,
+    )
+    .ok()?;
+    let anon = anonymous_url(url.trim())?;
+
+    let out = Command::new("git")
+        .arg("-c")
+        .arg("credential.helper=")
+        // No `-h`: that restricts to branch heads, HEAD is not one, and the
+        // empty match read as "could not tell" — so the guard never fired.
+        .args(["ls-remote", "--exit-code", &anon, "HEAD"])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_ASKPASS", "")
+        .env("SSH_ASKPASS", "")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .ok()?;
+
+    if out.status.success() {
+        return Some(true);
+    }
+    let err = String::from_utf8_lossy(&out.stderr).to_lowercase();
+    // A refusal we recognise means it is genuinely gated. Anything else
+    // (no network, DNS failure) is "could not tell".
+    if err.contains("authentication")
+        || err.contains("could not read username")
+        || err.contains("terminal prompts disabled")
+        || err.contains("not found")
+        || err.contains("403")
+        || err.contains("permission denied")
+    {
+        return Some(false);
+    }
+    None
+}
+
+#[cfg(test)]
+mod public_remote_tests {
+    use super::anonymous_url;
+
+    #[test]
+    fn an_ssh_remote_becomes_the_address_a_stranger_would_try() {
+        assert_eq!(
+            anonymous_url("git@github.com:zyads/heddle.git").as_deref(),
+            Some("https://github.com/zyads/heddle.git")
+        );
+    }
+
+    #[test]
+    fn a_username_in_the_url_is_dropped_so_the_probe_is_anonymous() {
+        // Leaving the userinfo in would let the probe authenticate and report
+        // a private repo as world-readable — the exact wrong answer.
+        assert_eq!(
+            anonymous_url("https://zman@github.com/zyads/aether.git").as_deref(),
+            Some("https://github.com/zyads/aether.git")
+        );
+        assert_eq!(
+            anonymous_url("ssh://git@gitlab.com/team/thing").as_deref(),
+            Some("https://gitlab.com/team/thing")
+        );
+    }
+
+    #[test]
+    fn a_local_path_is_not_something_we_can_ask_the_world_about() {
+        assert_eq!(anonymous_url("/srv/git/thing.git"), None);
+        assert_eq!(anonymous_url("../peer"), None);
+        assert_eq!(anonymous_url("file:///srv/git/thing"), None);
+        assert_eq!(anonymous_url(""), None);
     }
 }

@@ -48,8 +48,10 @@ usage:
   heddle clean                                  remove worktrees of woven threads
                                               (refuses uncaptured divergence)
   heddle sync [--remote NAME] [--auto on|off]   sync leases/threads/fabric with a
-                                              git remote (shares scoped content
-                                              there — same exposure as a push)
+       [--anyway]                             git remote. Publishes the content
+                                              of leased files there, so it
+                                              refuses a remote anyone can read
+                                              unless you pass --anyway.
   heddle status                                 threads, leases, orphans, peers
   heddle log                                    fabric history + recent events
   heddle mcp                                    stdio MCP server (heddle_status,
@@ -410,6 +412,7 @@ fn print_sync(out: &sync::SyncOutcome, brief: bool) {
 fn cmd_sync(rest: &[String]) -> Result<(), String> {
     let mut remote = None;
     let mut auto = None;
+    let mut anyway = false;
     let mut it = rest.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -428,6 +431,7 @@ fn cmd_sync(rest: &[String]) -> Result<(), String> {
                     other => return Err(format!("--auto takes on|off, got '{other}'")),
                 });
             }
+            "--anyway" => anyway = true,
             other => return Err(format!("unknown sync flag '{other}'")),
         }
     }
@@ -439,7 +443,7 @@ fn cmd_sync(rest: &[String]) -> Result<(), String> {
              remote — the same exposure as pushing a branch there."
         );
     }
-    let out = sync::sync(engine, &repo.id, remote.as_deref(), auto)?;
+    let out = sync::sync_opts(engine, &repo.id, remote.as_deref(), auto, anyway)?;
     print_sync(&out, false);
     if out.fabric_pulled == 0
         && out.fabric_pushed == 0
