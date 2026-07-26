@@ -29,6 +29,11 @@ usage:
   heddle init [--verify CMD] [--git-bridge]     register the current directory
        [--bridge-mode squash|stitches|both]   (bridge granularity; default
                                               squash — one commit per weave)
+                                              CMD runs on EVERY propose and
+                                              every agent waits for it: point
+                                              it at a fast subset (a few
+                                              seconds), not the full suite —
+                                              leave that to CI.
   heddle config [--bridge-mode MODE]            show this repo's config, or set
                                               the git-bridge granularity
   heddle lease \"<goal>\" <scope...>              declare an intent lease; on a git
@@ -211,7 +216,59 @@ fn cmd_init(rest: &[String]) -> Result<(), String> {
     println!("  verify:     {}", repo.verify_cmd);
     println!("  git bridge: {}", bridge_line(&repo));
     println!("  data:       {}", engine.base().display());
+    if let Some(note) = time_the_verify(&repo) {
+        println!("{note}");
+    }
     Ok(())
+}
+
+/// How long `init` will wait on the verify before giving up on timing it.
+/// The gate itself allows far longer ([`heddle::weave::VERIFY_TIMEOUT_SECS`]);
+/// this is only about telling you what you signed up for, so it stops early.
+const TIMING_LIMIT_SECS: u64 = 20;
+
+/// Past this, a verify is slow enough that it will be felt on every propose.
+const SLOW_VERIFY_SECS: u64 = 5;
+
+/// Time the freshly-registered verify command ONCE and, when it is slow,
+/// say so. A warning, never a refusal: `init` has already succeeded by the
+/// time this runs, and neither a red verify nor a timeout changes that.
+///
+/// Skipped when stdout is not a terminal (scripts and CI get no value from a
+/// note nobody reads, and should not pay 20 seconds for it) or when
+/// `HEDDLE_SKIP_VERIFY_TIMING` is set.
+fn time_the_verify(repo: &RepoConfig) -> Option<String> {
+    use std::io::IsTerminal;
+    if std::env::var_os("HEDDLE_SKIP_VERIFY_TIMING").is_some() || !std::io::stdout().is_terminal() {
+        return None;
+    }
+    println!("  timing that verify once (up to {TIMING_LIMIT_SECS}s) — ^C to skip…");
+    let started = std::time::Instant::now();
+    let _ = heddle::weave::run_verify(
+        &repo.verify_cmd,
+        std::path::Path::new(&repo.path),
+        TIMING_LIMIT_SECS,
+    );
+    let secs = started.elapsed().as_secs();
+    slow_verify_note(secs, secs >= TIMING_LIMIT_SECS)
+}
+
+/// The one honest line, or `None` when the verify was quick enough to say
+/// nothing. Split out from the running so it can be tested without waiting
+/// on a real command.
+fn slow_verify_note(secs: u64, hit_limit: bool) -> Option<String> {
+    let took = if hit_limit {
+        format!("that verify was still going after {secs}s")
+    } else if secs < SLOW_VERIFY_SECS {
+        return None;
+    } else {
+        format!("that verify took {secs}s")
+    };
+    Some(format!(
+        "note: {took} — it runs on every propose, and every agent waits for it.\n\
+         Consider pointing --verify at a fast subset (e.g. `pytest -q -m \"not slow\"`, \
+         `make test-fast`) and leaving the full suite to CI."
+    ))
 }
 
 /// One honest line about what the bridge will do for this repo.
@@ -763,4 +820,49 @@ fn cmd_log() -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_slow_verify_gets_a_note_and_it_names_the_seconds() {
+        // Quick enough that nobody will feel it — say nothing.
+        assert_eq!(slow_verify_note(0, false), None);
+        assert_eq!(slow_verify_note(SLOW_VERIFY_SECS - 1, false), None);
+
+        let note = slow_verify_note(49, false).expect("49s is worth a word");
+        assert!(note.contains("took 49s"), "{note}");
+        assert!(note.contains("every propose"), "{note}");
+        assert!(note.contains("test-fast"), "{note}");
+
+        // Timed out: honest about not having waited for the end.
+        let note = slow_verify_note(TIMING_LIMIT_SECS, true).expect("a timeout is always slow");
+        assert!(
+            note.contains(&format!("still going after {TIMING_LIMIT_SECS}s")),
+            "{note}"
+        );
+    }
+
+    #[test]
+    fn timing_is_skipped_when_asked_to_be() {
+        // Set for this process; the check is env-var presence, and cargo's
+        // test harness gives us no tty either — both paths return None, so
+        // no test ever waits on a real verify command.
+        std::env::set_var("HEDDLE_SKIP_VERIFY_TIMING", "1");
+        let repo = RepoConfig {
+            id: "repo-t".into(),
+            path: ".".into(),
+            verify_cmd: "sleep 60".into(),
+            git_bridge: false,
+            bridge_mode: Default::default(),
+            registered_ms: 0,
+            sync_remote: None,
+            auto_sync: false,
+        };
+        let started = std::time::Instant::now();
+        assert_eq!(time_the_verify(&repo), None);
+        assert!(started.elapsed().as_secs() < 5, "it must not have run anything");
+    }
 }
