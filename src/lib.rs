@@ -109,7 +109,12 @@ pub const MAX_GOAL_CHARS: usize = 300;
 pub const MAX_CRITERIA: usize = 20;
 pub const MAX_SCOPE_PATTERNS: usize = 32;
 pub const MAX_PATTERN_CHARS: usize = 300;
-pub const MAX_REPOS: usize = 20;
+/// How many repos one person may register. The other caps here exist to stop a
+/// runaway agent filling the disk; this one does not — "how many projects do
+/// you own" is a fact about the user, not a risk. At 20 it refused the twenty
+/// first repo of a real working checkout, which reads as Heddle being broken
+/// rather than Heddle protecting anything.
+pub const MAX_REPOS: usize = 200;
 pub const MAX_THREADS_PER_REPO: usize = 200;
 pub const MAX_STITCHES_PER_THREAD: usize = 200;
 pub const MAX_WEAVES_PER_REPO: usize = 500;
