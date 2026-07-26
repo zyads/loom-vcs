@@ -62,7 +62,10 @@ state: ~/.heddle (override with HEDDLE_DATA)";
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let verb = args.first().map(String::as_str).unwrap_or("");
-    let rest = &args[1..];
+    // `&args[1..]` panics when there are no arguments at all — and running
+    // `heddle` bare is exactly what the docs tell people to do to see the
+    // command list, so the first thing a new user did was watch it crash.
+    let rest = args.get(1..).unwrap_or(&[]);
     let out = match verb {
         "init" => cmd_init(rest),
         "config" => cmd_config(rest),
