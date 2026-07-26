@@ -100,6 +100,14 @@ cd your-repo
 heddle init --verify "cargo check"     # or any command that exits 0 on green
 ```
 
+**Keep the verify fast.** It runs on *every* `heddle propose`, and every agent
+waits for it before its work can land — a 49-second suite is 49 seconds of
+every agent's time, every attempt. Point it at a quick subset (a few seconds:
+`cargo check`, `pytest -q -m "not slow"`, `npm run test:fast`) and let the full
+suite run in CI. `heddle init` times the command once and tells you if it is
+slow (it skips that when stdout isn't a terminal, or with
+`HEDDLE_SKIP_VERIFY_TIMING=1`).
+
 **A:**
 
 ```bash

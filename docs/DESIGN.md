@@ -84,6 +84,12 @@ merge rules (below). Red never lands — not "shouldn't," *cannot*: fabric
 advancement is a single operation whose preconditions are a green verify, an
 explicit yes, an unmoved fabric parent, and no merge conflicts.
 
+The verify command is therefore on the critical path of every propose, for
+every agent — so it should take a few seconds, not minutes. Configure it as a
+fast subset (`cargo check`, `pytest -q -m "not slow"`, `make test-fast`) and
+leave the full suite to CI; `heddle init` times it once and warns when it is
+slower than ~5s. A gate people wait on is a gate people turn off.
+
 ### 5. Orphans — crash-safety for work, not just data
 When a thread's lease stops heart-beating, the thread becomes an **orphan**:
 last stitch seconds old, goal and criteria attached, worktree preserved.
