@@ -57,6 +57,7 @@ usage:
                                               of leased files there, so it
                                               refuses a remote anyone can read
                                               unless you pass --anyway.
+  heddle repair [--scan <dir>] [--dry-run]      rebind repos that moved on disk
   heddle status                                 threads, leases, orphans, peers
   heddle log                                    fabric history + recent events
   heddle mcp                                    stdio MCP server (heddle_status,
@@ -84,6 +85,7 @@ fn main() -> ExitCode {
         "withdraw" => cmd_withdraw(),
         "adopt" => cmd_adopt(rest),
         "clean" => cmd_clean(),
+        "repair" => cmd_repair(rest),
         "sync" => cmd_sync(rest),
         "status" => cmd_status(),
         "log" => cmd_log(),
@@ -550,6 +552,39 @@ fn cmd_clean() -> Result<(), String> {
     Ok(())
 }
 
+/// `heddle repair [--scan <dir>]... [--dry-run]` — rebind repos that moved.
+fn cmd_repair(rest: &[String]) -> Result<(), String> {
+    let mut roots: Vec<String> = Vec::new();
+    let mut dry_run = false;
+    let mut i = 0;
+    while i < rest.len() {
+        match rest[i].as_str() {
+            "--dry-run" | "-n" => dry_run = true,
+            "--scan" => {
+                i += 1;
+                let r = rest.get(i).ok_or("--scan needs a directory")?;
+                roots.push(r.clone());
+            }
+            other => return Err(format!("unknown flag '{other}' for repair")),
+        }
+        i += 1;
+    }
+    let report = store().repair_repos(&roots, dry_run);
+    let verb = if dry_run { "would rebind" } else { "rebound" };
+    for r in &report.rebound {
+        println!("{verb} {} -> {} (by {})", r.old_path, r.new_path, r.matched_by);
+    }
+    for (path, reason) in &report.unmatched {
+        println!("left alone {path}: {reason}");
+    }
+    if report.rebound.is_empty() && report.unmatched.is_empty() {
+        println!("every registered repo is where heddle expects it");
+    } else if dry_run && !report.rebound.is_empty() {
+        println!("\nnothing changed — rerun without --dry-run to apply");
+    }
+    Ok(())
+}
+
 fn cmd_stitch(rest: &[String]) -> Result<(), String> {
     let engine = store();
     let (repo, lease_id, _thread_id) = target(engine, rest)?;
@@ -858,6 +893,7 @@ mod tests {
             git_bridge: false,
             bridge_mode: Default::default(),
             registered_ms: 0,
+            git_root_commit: None,
             sync_remote: None,
             auto_sync: false,
         };

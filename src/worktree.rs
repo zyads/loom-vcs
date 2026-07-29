@@ -62,6 +62,63 @@ pub fn add(repo: &Path, dest: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// The repo's **root commit** — the sha of its first parentless commit. This
+/// is the one identity that survives `mv`: paths change, remotes change, the
+/// working tree changes, but a repo's root commit is fixed at `git init`.
+/// Heddle keys a moved repo back to its state with it (see `repair_repos`).
+///
+/// `None` when the repo has no commits yet, isn't a git repo, or has several
+/// root commits (grafted/merged histories) — an ambiguous identity is no
+/// identity, and Heddle would rather fall back to a name match it tells you
+/// about than silently bind state to the wrong repo.
+pub fn root_commit(repo: &Path) -> Option<String> {
+    let out = git(repo, &["rev-list", "--max-parents=0", "HEAD"]).ok()?;
+    let mut roots = out.split_whitespace();
+    let first = roots.next()?.to_string();
+    if roots.next().is_some() {
+        return None;
+    }
+    Some(first)
+}
+
+/// Re-point this repo's worktree metadata after the repo (or the worktrees)
+/// moved on disk — the same job `git worktree repair` does, which is exactly
+/// why it IS `git worktree repair`.
+///
+/// `moved` MUST list the worktrees' NEW paths. Bare `git worktree repair`
+/// only fixes worktrees it can still find at their recorded locations, so
+/// when the worktrees themselves moved it repairs nothing — and a `prune`
+/// after that deletes their administrative entries, orphaning intact
+/// checkouts. Naming the new paths is what lets git re-point both sides.
+///
+/// Best-effort: a repo with no worktrees succeeds trivially, and a failure
+/// here never blocks a rebind.
+pub fn repair(repo: &Path, moved: &[String]) -> Result<(), String> {
+    let mut args: Vec<&str> = vec!["worktree", "repair"];
+    args.extend(moved.iter().map(String::as_str));
+    git(repo, &args).map(|_| ())
+}
+
+/// Every worktree directory directly under `dir` — the new locations handed
+/// to [`repair`] after a state dir moved.
+pub fn dirs_in(dir: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .map(|p| p.to_string_lossy().to_string())
+        .collect()
+}
+
+/// Drop worktree registrations whose directory is gone. `git worktree prune`
+/// is safe by construction — it only forgets entries git can no longer find.
+pub fn prune(repo: &Path) -> Result<(), String> {
+    git(repo, &["worktree", "prune"]).map(|_| ())
+}
+
 /// Remove a worktree at `dest`. `--force` because the worktree is EXPECTED
 /// to be dirty relative to its checkout (the thread's edits live there) —
 /// callers run their own "is everything captured in a stitch?" check first;

@@ -451,6 +451,7 @@ mod tests {
                 git_bridge: false,
                 bridge_mode: BridgeMode::Squash,
                 registered_ms: 0,
+                git_root_commit: None,
                 sync_remote: None,
                 auto_sync: false,
             },

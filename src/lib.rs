@@ -77,7 +77,7 @@ pub mod weave;
 pub mod worktree;
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
@@ -190,6 +190,14 @@ pub struct RepoConfig {
     #[serde(default)]
     pub bridge_mode: BridgeMode,
     pub registered_ms: u64,
+    /// The repo's git root commit, captured at registration — the identity
+    /// that survives a `mv` when `path` and `id` (a hash of `path`) do not.
+    /// `heddle repair` uses it to rebind moved repos to their existing state
+    /// instead of silently stranding it. Serde-default: registries written
+    /// before this field existed load with `None` and get backfilled on the
+    /// next register or repair.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_root_commit: Option<String>,
     /// The git remote `heddle sync` talks to, remembered from the first
     /// `heddle sync --remote <name>`. `None` = this repo has never synced.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -654,6 +662,8 @@ impl Heddle {
         }
         let canon_str = canon.to_string_lossy().to_string();
         let id = repo_id_for(&canon_str);
+        // Captured outside the state lock — this shells out to git.
+        let root_commit = worktree::root_commit(&canon);
         let cmd = verify_cmd
             .map(|c| c.trim().to_string())
             .filter(|c| !c.is_empty())
@@ -662,6 +672,10 @@ impl Heddle {
             if let Some(existing) = s.repos.iter_mut().find(|r| r.id == id) {
                 existing.verify_cmd = cmd.clone();
                 existing.git_bridge = git_bridge;
+                // Backfill for registries written before identity was kept.
+                if existing.git_root_commit.is_none() {
+                    existing.git_root_commit = root_commit.clone();
+                }
                 return Ok(existing.clone());
             }
             if s.repos.len() >= MAX_REPOS {
@@ -674,6 +688,7 @@ impl Heddle {
                 git_bridge,
                 bridge_mode: BridgeMode::default(),
                 registered_ms: now_ms(),
+                git_root_commit: root_commit.clone(),
                 sync_remote: None,
                 auto_sync: false,
             };
@@ -768,6 +783,216 @@ impl Heddle {
                 .max_by_key(|r| r.path.len())
                 .cloned()
         })
+    }
+
+    // -- repair (moved repos) -----------------------------------------------
+
+    /// Rebind registered repos whose directory has MOVED — Heddle's answer to
+    /// `git worktree repair`.
+    ///
+    /// A repo's id is a hash of its canonical path, so `mv` used to strand
+    /// everything: the registry pointed at a path that no longer existed, a
+    /// re-`init` at the new path minted a fresh empty id, and the old state
+    /// (threads, stitches, blobs) plus its git worktree registrations were
+    /// left behind with nothing able to reach them.
+    ///
+    /// Repair looks for each missing repo under `scan_roots` and rebinds it:
+    /// the state dir is renamed to the new id, thread/fabric back-references
+    /// and worktree paths are rewritten, and `git worktree repair` re-points
+    /// git's own metadata. Matching is by **root commit** (exact) and falls
+    /// back to a unique **basename** match, which the report labels as such —
+    /// an ambiguous or unmatched repo is reported, never guessed at.
+    ///
+    /// `dry_run` computes the whole plan and touches nothing.
+    pub fn repair_repos(&self, scan_roots: &[String], dry_run: bool) -> RepairReport {
+        let mut report = RepairReport::default();
+
+        // Phase 1 (unlocked): who is missing, and what are the candidates?
+        // Everything here is filesystem + git work, so it stays out of the
+        // state lock.
+        let missing: Vec<RepoConfig> = self.with(|s, _| {
+            s.repos
+                .iter()
+                .filter(|r| !Path::new(&r.path).is_dir())
+                .cloned()
+                .collect()
+        });
+        if missing.is_empty() {
+            return report;
+        }
+        let known: Vec<String> = self.with(|s, _| s.repos.iter().map(|r| r.path.clone()).collect());
+
+        // Default search roots: the nearest existing ancestor of each missing
+        // path. A repo moved into a subfolder of where it used to live (the
+        // common tidy-up) is found without the caller naming a root.
+        let mut roots: Vec<PathBuf> = scan_roots.iter().map(PathBuf::from).collect();
+        if roots.is_empty() {
+            for r in &missing {
+                let mut p = Path::new(&r.path);
+                while let Some(parent) = p.parent() {
+                    if parent.is_dir() {
+                        if !roots.contains(&parent.to_path_buf()) {
+                            roots.push(parent.to_path_buf());
+                        }
+                        break;
+                    }
+                    p = parent;
+                }
+            }
+        }
+        let candidates = scan_for_git_repos(&roots, REPAIR_SCAN_DEPTH, &known);
+
+        let mut plans: Vec<(RepoConfig, String, &'static str)> = Vec::new();
+        let mut claimed: Vec<String> = Vec::new();
+        for r in &missing {
+            let old_base = Path::new(&r.path)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            // Exact: same root commit. Only ever one repo can match.
+            let by_commit: Vec<&Candidate> = match &r.git_root_commit {
+                Some(rc) => candidates
+                    .iter()
+                    .filter(|c| c.root_commit.as_deref() == Some(rc.as_str()))
+                    .collect(),
+                None => Vec::new(),
+            };
+            let (hits, how): (Vec<&Candidate>, &'static str) = if !by_commit.is_empty() {
+                // Several repos can share a root commit (a clone, or a fork
+                // that never rewrote history). Identity narrows the field;
+                // the name settles it — and if it doesn't, we say so below
+                // rather than pick one.
+                let named: Vec<&Candidate> = by_commit
+                    .iter()
+                    .copied()
+                    .filter(|c| c.basename == old_base)
+                    .collect();
+                if by_commit.len() > 1 && named.len() == 1 {
+                    (named, "root commit")
+                } else {
+                    (by_commit, "root commit")
+                }
+            } else {
+                (
+                    candidates
+                        .iter()
+                        .filter(|c| c.basename == old_base)
+                        .collect(),
+                    "name",
+                )
+            };
+            let hits: Vec<&&Candidate> = hits
+                .iter()
+                .filter(|c| !claimed.contains(&c.path))
+                .collect();
+            match hits.len() {
+                0 => report
+                    .unmatched
+                    .push((r.path.clone(), "no candidate found under the search roots".into())),
+                1 => {
+                    let dest = hits[0].path.clone();
+                    claimed.push(dest.clone());
+                    plans.push((r.clone(), dest, how));
+                }
+                n => report.unmatched.push((
+                    r.path.clone(),
+                    format!("{n} candidates matched by {how} — rerun with an explicit search root"),
+                )),
+            }
+        }
+
+        if dry_run {
+            for (r, dest, how) in plans {
+                report.rebound.push(Rebind {
+                    old_path: r.path,
+                    new_path: dest,
+                    old_id: r.id,
+                    new_id: String::new(),
+                    matched_by: how.to_string(),
+                });
+            }
+            return report;
+        }
+
+        // Phase 2: rebind each plan — state dir rename, then state rewrite.
+        for (repo, dest, how) in plans {
+            let new_id = repo_id_for(&dest);
+            if new_id != repo.id {
+                let base = self.base();
+                let from = base.join(&repo.id);
+                let to = base.join(&new_id);
+                if from.is_dir() {
+                    if to.exists() {
+                        report.unmatched.push((
+                            repo.path.clone(),
+                            format!("{} already has heddle state — refusing to overwrite", dest),
+                        ));
+                        continue;
+                    }
+                    if let Err(e) = std::fs::rename(&from, &to) {
+                        report
+                            .unmatched
+                            .push((repo.path.clone(), format!("cannot move state dir: {e}")));
+                        continue;
+                    }
+                }
+            }
+            let root_commit = worktree::root_commit(Path::new(&dest));
+            let old_wt_dir = store::worktrees_dir(&self.base(), &repo.id)
+                .to_string_lossy()
+                .to_string();
+            let new_wt_dir = store::worktrees_dir(&self.base(), &new_id)
+                .to_string_lossy()
+                .to_string();
+
+            self.with(|s, base| {
+                if let Some(rc) = s.repos.iter_mut().find(|r| r.id == repo.id) {
+                    rc.id = new_id.clone();
+                    rc.path = dest.clone();
+                    if rc.git_root_commit.is_none() {
+                        rc.git_root_commit = root_commit.clone();
+                    }
+                }
+                if let Some(mut rs) = s.repo_states.remove(&repo.id) {
+                    rs.fabric.repo_id = new_id.clone();
+                    for t in rs.threads.iter_mut() {
+                        t.repo_id = new_id.clone();
+                        if let Some(wt) = t.worktree.as_mut() {
+                            if let Some(rest) = wt.strip_prefix(&old_wt_dir) {
+                                *wt = format!("{new_wt_dir}{rest}");
+                            }
+                        }
+                    }
+                    s.repo_states.insert(new_id.clone(), rs);
+                }
+                store::append_event(
+                    base,
+                    &new_id,
+                    &serde_json::json!({
+                        "ts_ms": now_ms(), "kind": "repo_repaired",
+                        "from": repo.path, "to": dest, "matched_by": how,
+                    }),
+                );
+            });
+
+            // Git's own metadata last: re-point every worktree that moved with
+            // the state dir, THEN forget the ones whose directory is truly
+            // gone. Order matters — pruning first (or repairing without the
+            // new paths) deletes the administrative entry of a worktree whose
+            // checkout is sitting right there, intact.
+            let moved_wts = worktree::dirs_in(Path::new(&new_wt_dir));
+            let _ = worktree::repair(Path::new(&dest), &moved_wts);
+            let _ = worktree::prune(Path::new(&dest));
+
+            report.rebound.push(Rebind {
+                old_path: repo.path,
+                new_path: dest,
+                old_id: repo.id,
+                new_id,
+                matched_by: how.to_string(),
+            });
+        }
+        report
     }
 
     // -- leases -------------------------------------------------------------
@@ -1457,7 +1682,25 @@ impl Heddle {
     /// Proposed with an honest "re-propose" note. Callers reach this only
     /// after an explicit human yes ([`consent::WeaveConsent`] in the
     /// standalone binary, an operator Approve in an embedding host).
+    /// Land a weave, then retire the thread's worktree.
+    ///
+    /// A woven thread is finished, so its isolated worktree is garbage the
+    /// moment the weave lands. Leaving that to a manual `heddle clean` meant
+    /// worktrees piled up for as long as nobody remembered to run it, each
+    /// one a full checkout on disk and a live registration in the repo's git
+    /// metadata. Cleanup rides the event that makes it correct.
+    ///
+    /// The sweep is best-effort and never fails a landed weave: `clean_worktrees`
+    /// keeps anything with uncaptured divergence, and a removal error is
+    /// reported by `heddle clean`, not raised here — the weave HAS landed and
+    /// saying otherwise would be a lie.
     pub fn land_weave(&self, weave_id: &str) -> Result<LandOutcome, String> {
+        let out = self.land_weave_inner(weave_id)?;
+        let _ = self.clean_worktrees(&out.repo.id);
+        Ok(out)
+    }
+
+    fn land_weave_inner(&self, weave_id: &str) -> Result<LandOutcome, String> {
         let now = now_ms();
         self.with(|s, base| {
             let repo_id = s
@@ -2515,6 +2758,86 @@ fn prune(s: &mut HeddleState) {
     }
 }
 
+/// How deep under a search root `heddle repair` looks for a moved repo.
+/// Three levels covers the realistic tidy-up (`work/AETHER` →
+/// `work/aether/AETHER`) without walking an entire home directory.
+const REPAIR_SCAN_DEPTH: usize = 3;
+
+/// One relocation `heddle repair` performed (or would, under `--dry-run`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Rebind {
+    pub old_path: String,
+    pub new_path: String,
+    pub old_id: String,
+    /// Empty under `--dry-run`: nothing was minted.
+    pub new_id: String,
+    /// `"root commit"` (exact) or `"name"` (unique basename match).
+    pub matched_by: String,
+}
+
+/// What `repair_repos` hands back: what moved, and what it could not place.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct RepairReport {
+    pub rebound: Vec<Rebind>,
+    /// (old path, honest reason) for every repo left alone.
+    pub unmatched: Vec<(String, String)>,
+}
+
+/// A git repo found under a search root, with the identity used to match it.
+struct Candidate {
+    path: String,
+    basename: String,
+    root_commit: Option<String>,
+}
+
+/// Walk `roots` to `depth`, collecting git repos that are not already bound
+/// to a registered repo. Skips dotted directories (`.git`, `.venv`, caches)
+/// and never follows symlinks — a scan must not wander out of the tree it
+/// was pointed at.
+fn scan_for_git_repos(roots: &[PathBuf], depth: usize, known: &[String]) -> Vec<Candidate> {
+    let mut found: Vec<Candidate> = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
+    let mut frontier: Vec<(PathBuf, usize)> = roots.iter().map(|r| (r.clone(), 0)).collect();
+    while let Some((dir, d)) = frontier.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            if !p.is_dir() || p.is_symlink() {
+                continue;
+            }
+            let name = e.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') {
+                continue;
+            }
+            let canon = match std::fs::canonicalize(&p) {
+                Ok(c) => c.to_string_lossy().to_string(),
+                Err(_) => continue,
+            };
+            if seen.contains(&canon) {
+                continue;
+            }
+            seen.push(canon.clone());
+            if worktree::is_git_repo(&p) {
+                if !known.contains(&canon) {
+                    found.push(Candidate {
+                        basename: name,
+                        root_commit: worktree::root_commit(&p),
+                        path: canon,
+                    });
+                }
+                // A git repo is a leaf: heddle repos don't nest inside one.
+                continue;
+            }
+            if d + 1 < depth {
+                frontier.push((p, d + 1));
+            }
+        }
+    }
+    found
+}
+
 /// Stable repo id from the canonical path: `repo-<first 16 hex of sha256>`.
 pub fn repo_id_for(canonical_path: &str) -> String {
     format!("repo-{}", &store::content_hash(canonical_path.as_bytes())[..16])
@@ -2874,6 +3197,130 @@ mod tests {
     }
 
     #[test]
+    fn landing_a_weave_retires_the_threads_worktree() {
+        let (heddle, _repo_dir, repo) = git_rig("autoclean");
+        let d = heddle
+            .declare_lease(&repo.id, "t", "edit", vec!["src/**".into()], vec![], None)
+            .expect("lease");
+        let wt = PathBuf::from(d.thread.worktree.as_ref().expect("isolated"));
+        std::fs::write(wt.join("src/main.rs"), "fn main() { /* v2 */ }\n").unwrap();
+        heddle.stitch(&d.lease.id).expect("stitch");
+        let p = heddle.propose(&d.thread.id).expect("propose");
+        assert!(p.green);
+        heddle.land_weave(&p.weave.id).expect("land");
+        assert!(
+            !wt.exists(),
+            "a woven thread's worktree is gone without anyone running `heddle clean`"
+        );
+    }
+
+    #[test]
+    fn repair_rebinds_a_moved_repo_to_its_existing_state() {
+        let (heddle, repo_dir, repo) = git_rig("moved");
+        let d = heddle
+            .declare_lease(&repo.id, "t", "in flight", vec!["src/**".into()], vec![], None)
+            .expect("lease");
+        let thread_id = d.thread.id.clone();
+
+        // The tidy-up: the repo moves into a subfolder.
+        let nest = repo_dir.parent().unwrap().join("moved-nest");
+        std::fs::create_dir_all(&nest).unwrap();
+        let dest = nest.join(repo_dir.file_name().unwrap());
+        std::fs::rename(&repo_dir, &dest).unwrap();
+        heddle.reset_cache();
+
+        // Before repair the repo is unreachable from its new location.
+        assert!(
+            heddle.repo_containing(dest.to_str().unwrap()).is_none(),
+            "a moved repo is stranded until repaired"
+        );
+
+        let plan = heddle.repair_repos(&[], true);
+        assert_eq!(plan.rebound.len(), 1, "dry run plans the rebind: {plan:?}");
+        assert!(
+            heddle.repo_containing(dest.to_str().unwrap()).is_none(),
+            "--dry-run changed nothing"
+        );
+
+        let report = heddle.repair_repos(&[], false);
+        assert_eq!(report.rebound.len(), 1, "one repo rebound: {report:?}");
+        assert_eq!(report.rebound[0].matched_by, "root commit");
+
+        let found = heddle
+            .repo_containing(dest.to_str().unwrap())
+            .expect("moved repo is reachable again");
+        assert_eq!(found.path, dest.canonicalize().unwrap().to_string_lossy());
+        assert_ne!(found.id, repo.id, "new path means a new id");
+
+        // The state came WITH it — thread, and a worktree path that resolves.
+        let snap = heddle.snapshot();
+        let rs = snap
+            .repo_states
+            .get(&found.id)
+            .expect("state moved to the new id");
+        let t = rs
+            .threads
+            .iter()
+            .find(|t| t.id == thread_id)
+            .expect("thread survived the move");
+        assert_eq!(t.repo_id, found.id, "back-reference rewritten");
+        let wt = PathBuf::from(t.worktree.as_ref().expect("still isolated"));
+        assert!(wt.exists(), "worktree path points at the relocated state dir");
+
+        // ...and git still KNOWS it. The worktrees move with the state dir, so
+        // repair has to name their new paths; repairing blind and then pruning
+        // deletes the registration of a checkout that is sitting right there.
+        let listed = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&dest)
+            .args(["worktree", "list"])
+            .output()
+            .expect("git worktree list");
+        let listed = String::from_utf8_lossy(&listed.stdout).to_string();
+        assert!(
+            listed.contains(&wt.to_string_lossy().to_string()),
+            "the relocated worktree is still a registered git worktree:\n{listed}"
+        );
+        // And it is a working checkout, not an orphaned directory.
+        let st = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&wt)
+            .args(["status", "--porcelain"])
+            .output()
+            .expect("git status in worktree");
+        assert!(st.status.success(), "git works inside the relocated worktree");
+    }
+
+    #[test]
+    fn repair_leaves_an_ambiguous_match_alone_rather_than_guessing() {
+        let (heddle, repo_dir, _repo) = git_rig("ambig");
+        // Two candidates with the same basename and NO shared identity: the
+        // registered repo's root commit exists in neither.
+        let nest = repo_dir.parent().unwrap().join("ambig-nest");
+        let name = repo_dir.file_name().unwrap();
+        for side in ["a", "b"] {
+            let dir = nest.join(side).join(name);
+            mk_repo(&dir, &[("src/main.rs", "fn main() {}\n")]);
+            git_ok(&dir, &["init", "-q"]);
+            git_ok(&dir, &["config", "user.email", "heddle@test"]);
+            git_ok(&dir, &["config", "user.name", "heddle test"]);
+            git_ok(&dir, &["add", "-A"]);
+            git_ok(&dir, &["commit", "-q", "-m", format!("base {side}").as_str()]);
+        }
+        std::fs::remove_dir_all(&repo_dir).unwrap();
+        heddle.reset_cache();
+
+        let report = heddle.repair_repos(&[nest.to_string_lossy().to_string()], false);
+        assert!(report.rebound.is_empty(), "nothing guessed: {report:?}");
+        assert_eq!(report.unmatched.len(), 1);
+        assert!(
+            report.unmatched[0].1.contains("candidates matched"),
+            "and it says why: {}",
+            report.unmatched[0].1
+        );
+    }
+
+    #[test]
     fn isolated_lease_gets_a_worktree_and_edits_there_never_touch_the_repo() {
         let (heddle, repo_dir, repo) = git_rig("iso");
         let d = heddle
@@ -3128,13 +3575,15 @@ mod tests {
         std::fs::write(wt.join("src/main.rs"), "fn main() { /* done */ }\n").unwrap();
         heddle.stitch(&d.lease.id).expect("stitch");
         let p = heddle.propose(&d.thread.id).expect("propose");
+        // Diverge BEFORE the weave lands: uncaptured bytes mean even the
+        // automatic post-land sweep has to leave this worktree standing.
+        std::fs::write(wt.join("src/main.rs"), "fn main() { /* uncaptured */ }\n").unwrap();
         heddle.land_weave(&p.weave.id).expect("land");
+        assert!(wt.exists(), "auto-clean kept a worktree with uncaptured work");
         // A live thread's worktree is never cleaned.
         let d2 = heddle
             .declare_lease(&repo.id, "t", "still working", vec!["src/**".into()], vec![], None)
             .expect("lease 2");
-        // Divergence after weaving: refuse (uncaptured bytes would be lost).
-        std::fs::write(wt.join("src/main.rs"), "fn main() { /* uncaptured */ }\n").unwrap();
         let report = heddle.clean_worktrees(&repo.id).expect("clean 1");
         assert!(report.removed.is_empty());
         assert!(report
