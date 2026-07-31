@@ -8,7 +8,7 @@
 # several unrelated Loom projects. Library and installed binary: `heddle`.
 [package]
 name = "heddle"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 license = "MIT"
 description = "Version control for many hands moving at once (formerly loom-vcs): per-task git worktrees, intent leases, a green-by-construction fabric with honest file-level merges, orphan adoption, and multi-machine sync over any git remote."
@@ -27,7 +27,10 @@ path = "src/main.rs"
 
 [dependencies]
 serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.150"
+# preserve_order: `heddle adopt` merges into a user's .claude/settings.json /
+# .mcp.json and must hand the file back with ITS key order intact — reordering
+# someone's config into alphabetical is a diff nobody asked for.
+serde_json = { version = "1.0.150", features = ["preserve_order"] }
 sha2 = "0.10.9"
 hex = "0.4.3"
 

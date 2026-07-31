@@ -281,8 +281,22 @@ content-addressed whole-file blobs under `~/.heddle` (override `HEDDLE_DATA`),
 - `sync.rs`: the multi-machine layer above — state refs, CAS fabric,
   claims, mailbox — implemented over the repo's own `git` binary; the
   engine never shells git itself.
+- `savings.rs`: honest value accounting — counted facts from the event log
+  (toe-steps, same-file concurrent edits absorbed by isolation
+  (`OverlapEdit`, detected at stitch time, deduplicated per thread pair),
+  refused lands, rebases) and ONE labeled estimate whose constants are
+  measured locally or printed as stated assumptions; `--record-tokens`
+  attaches real harness numbers that replace the assumption. Warnings are
+  never monetized, and "nothing measurable was prevented" is a first-class
+  answer.
+- `enroll.rs`: zero-config agent adoption — `heddle init` / thread-less
+  `heddle adopt` write `.mcp.json` (MCP server), `.claude/settings.json`
+  (approval + `SessionStart` hook running `heddle status --brief`) and a
+  marker-fenced `CLAUDE.md` section. Order-preserving merges, user keys
+  always win, unparseable files refused, everything shown before writing,
+  `--dry-run` touches nothing.
 - `heddle` CLI: `init · config · lease · stitch · propose · export · rebase ·
-  withdraw · adopt · clean · sync · status · log · mcp`, with
+  withdraw · adopt · clean · sync · savings · status · log · mcp`, with
   `--lease/--thread` overrides for multi-seat terminals. Bare (flag-less)
   verbs resolve to the thread whose worktree contains the cwd, else the
   repo's only live thread; with several live threads they refuse with the

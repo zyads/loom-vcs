@@ -158,6 +158,15 @@ its goal, criteria, and worktree, checkpoint intact.
 
 ## Agents (Claude Code or any MCP client)
 
+Zero setup on Claude Code: `heddle init` (or `heddle adopt` in an
+already-initialized repo) wires the repo so agents pick Heddle up with **no
+prompting** — it registers the MCP server in `.mcp.json`, pre-approves it and
+adds a `SessionStart` hook (`heddle status --brief`, silent when nothing is
+live) in `.claude/settings.json`, and appends a short rules section to
+`CLAUDE.md` between markers. Everything is shown before it is written,
+idempotent, and previewable with `heddle adopt --dry-run`; `heddle init
+--no-adopt` opts out. Other MCP clients register the server themselves:
+
 ```bash
 claude mcp add heddle -- heddle mcp
 ```
@@ -214,6 +223,27 @@ the file content of your stitched scope go to that remote — the same
 exposure as pushing a branch there. `--auto` is opt-in per repo. Dead
 machines' threads show up as adoptable orphans; claims are first-push-wins
 on a git ref, and the loser is told who won.
+
+## Did it earn its keep? (`heddle savings`)
+
+Heddle counts what it prevents instead of asserting it. `heddle savings
+[--json]` reports the facts first — collisions warned at lease time, same-file
+concurrent edits the isolation absorbed (pair and file names attached), lands
+refused because the fabric moved, rebases — then ONE clearly-labeled estimate
+whose every constant is either measured from the repo's own data or printed
+as a stated assumption beside the number it produced. Feed it ground truth
+and the assumption leaves the model:
+
+```bash
+heddle savings --record-tokens <thread-id> <tokens>   # from your harness
+```
+
+Two things it will never do: turn lease-time *warnings* into a token number
+(an agent that self-partitioned saved re-work Heddle cannot honestly
+measure), and hide the zero — when nothing collision-shaped ever happened,
+the report says *"Heddle has not yet prevented anything measurable in this
+repo"* in those words. That sentence is the feature: a tool that can admit
+it wasn't needed is one you can believe when it says it was.
 
 ## Why not just git merge/rebase?
 
@@ -287,7 +317,7 @@ the same per-thread branch — review an agent's in-flight work with plain
 
 | rung | status |
 |---|---|
-| Several agents, one machine | shipped — worktree isolation, leases, green gate, orphans, configurable git bridge + draft-branch export (45 tests) |
+| Several agents, one machine | shipped — worktree isolation, leases, green gate, orphans, configurable git bridge + draft-branch export, honest savings metrics, zero-config agent enrollment (72 tests) |
 | A few people/machines, one shared git remote | shipped — `heddle sync`: state over `refs/heddle/*`, CAS fabric ref, cross-machine adoption claims; metadata is unsigned (machine ids are identity, not authentication) |
 | Team knobs (consent dials, envelopes) | exists in the Aether integration, which embeds this crate; the generic mailbox namespace here is the hook it rides on |
 | Many peers, no blessed remote (gossip) | design only — see [docs/DESIGN.md](docs/DESIGN.md), "Federation" |
