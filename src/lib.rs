@@ -785,6 +785,85 @@ impl Heddle {
         })
     }
 
+    /// The registered repo and thread whose isolated WORKTREE contains
+    /// `path` (the path itself or anything under it). Worktrees live under
+    /// the heddle data dir — outside every registered repo tree — so
+    /// [`Self::repo_containing`] cannot see them; this is how "I am standing
+    /// in this thread's worktree" becomes "I mean THIS thread". A worktree
+    /// that no longer exists on disk (woven, cleaned) never matches.
+    pub fn thread_containing(&self, path: &str) -> Option<(RepoConfig, Thread)> {
+        let canon = std::fs::canonicalize(path).ok()?;
+        let snap = self.snapshot();
+        for repo in &snap.repos {
+            let Some(rs) = snap.repo_states.get(&repo.id) else {
+                continue;
+            };
+            for t in &rs.threads {
+                let Some(wt) = &t.worktree else { continue };
+                let Ok(wt_canon) = std::fs::canonicalize(wt) else {
+                    continue;
+                };
+                if canon.starts_with(&wt_canon) {
+                    return Some((repo.clone(), t.clone()));
+                }
+            }
+        }
+        None
+    }
+
+    /// Bare-verb targeting: the ONE thread a flag-less `stitch` / `propose` /
+    /// `rebase` / `export` means, resolved from `cwd`. The rule, in order:
+    ///
+    /// 1. Standing inside a thread's isolated worktree names THAT thread —
+    ///    cwd is unambiguous intent.
+    /// 2. Otherwise, a repo with exactly ONE live thread is unambiguous.
+    /// 3. Otherwise REFUSE with the list of live threads, never guess.
+    ///
+    /// Rule 3 is why the shared solo pointer is NOT consulted here: several
+    /// agents share one data dir, so its last-lease-wins slot may name a
+    /// DIFFERENT agent's thread — guessing from it is exactly how stitches
+    /// and exports land on a stranger's work-line.
+    pub fn resolve_bare_target(&self, cwd: &str) -> Result<(RepoConfig, Thread), String> {
+        if let Some(found) = self.thread_containing(cwd) {
+            return Ok(found);
+        }
+        let repo = self.repo_containing(cwd).ok_or_else(|| {
+            "no registered repo contains this directory — run `heddle init` here first"
+                .to_string()
+        })?;
+        let snap = self.snapshot();
+        let rs = snap.repo_states.get(&repo.id).cloned().unwrap_or_default();
+        let live: Vec<&Thread> = rs.threads.iter().filter(|t| t.status.is_live()).collect();
+        match live.len() {
+            1 => Ok((repo, live[0].clone())),
+            0 => Err(
+                "no live thread in this repo — `heddle lease \"<goal>\" <scope...>` first \
+                 (or `heddle adopt <thread-id>`)"
+                    .to_string(),
+            ),
+            n => {
+                let mut msg = format!(
+                    "{n} live threads in this repo — refusing to guess which one you mean \
+                     (a wrong guess writes onto another agent's work):\n"
+                );
+                for t in &live {
+                    msg.push_str(&format!(
+                        "  --lease {}  thread {} [{:?}] — {}\n",
+                        t.lease_id.as_deref().unwrap_or("(none)"),
+                        t.id,
+                        t.status,
+                        t.goal
+                    ));
+                }
+                msg.push_str(
+                    "say which: pass --lease <id> (or --thread <id>; lease_id/thread_id over \
+                     MCP), or run from inside the thread's worktree",
+                );
+                Err(msg)
+            }
+        }
+    }
+
     // -- repair (moved repos) -----------------------------------------------
 
     /// Rebind registered repos whose directory has MOVED — Heddle's answer to
@@ -3402,6 +3481,95 @@ mod tests {
         assert!(read(&repo_dir.join("src/main.rs")).contains("alice+bob"));
         // util.rs kept Alice's version — Bob's stale base never overwrote it.
         assert!(read(&repo_dir.join("src/util.rs")).contains("alice"));
+    }
+
+    #[test]
+    fn bare_target_inside_a_worktree_means_that_thread_even_among_many() {
+        let (heddle, repo_dir, repo) = git_rig("bare-wt");
+        let da = heddle
+            .declare_lease(&repo.id, "alice", "restyle main", vec!["src/**".into()], vec![], None)
+            .expect("lease a");
+        let db = heddle
+            .declare_lease(&repo.id, "bob", "rework util", vec!["src/**".into()], vec![], None)
+            .expect("lease b");
+        let wa = PathBuf::from(da.thread.worktree.as_ref().expect("isolated"));
+        let wb = PathBuf::from(db.thread.worktree.as_ref().expect("isolated"));
+        // Standing in a worktree — even a subdirectory of it — names that
+        // thread, no matter how many others are live.
+        let (r, t) = heddle
+            .resolve_bare_target(wa.to_str().unwrap())
+            .expect("A's worktree resolves");
+        assert_eq!((r.id.as_str(), t.id.as_str()), (repo.id.as_str(), da.thread.id.as_str()));
+        let (_, t) = heddle
+            .resolve_bare_target(wb.join("src").to_str().unwrap())
+            .expect("a subdir of B's worktree resolves");
+        assert_eq!(t.id, db.thread.id, "B's worktree never means A's thread");
+        // The same inference names the repo for `thread_containing` callers.
+        let (r, t) = heddle.thread_containing(wb.to_str().unwrap()).expect("containing");
+        assert_eq!((r.id, t.id), (repo.id.clone(), db.thread.id.clone()));
+        // Outside any worktree the repo root stays ambiguous (see the
+        // refusal test) — but never resolves to the WRONG thread.
+        let err = heddle.resolve_bare_target(repo_dir.to_str().unwrap()).unwrap_err();
+        assert!(err.contains(&da.thread.id) && err.contains(&db.thread.id), "{err}");
+    }
+
+    #[test]
+    fn bare_target_with_one_live_thread_is_unambiguous() {
+        let (heddle, repo_dir, repo) = rig("bare-one");
+        let d = heddle
+            .declare_lease(&repo.id, "solo", "only work-line", vec!["src/**".into()], vec![], None)
+            .expect("lease");
+        let (r, t) = heddle
+            .resolve_bare_target(repo_dir.to_str().unwrap())
+            .expect("one live thread resolves bare");
+        assert_eq!(r.id, repo.id);
+        assert_eq!(t.id, d.thread.id);
+    }
+
+    #[test]
+    fn bare_target_refuses_to_guess_between_live_threads() {
+        let (heddle, repo_dir, repo) = rig("bare-many");
+        let da = heddle
+            .declare_lease(&repo.id, "alice", "restyle main", vec!["src/**".into()], vec![], None)
+            .expect("lease a");
+        let db = heddle
+            .declare_lease(&repo.id, "bob", "reword readme", vec!["README.md".into()], vec![], None)
+            .expect("lease b");
+        // Two live threads, no flag, not in a worktree: REFUSED — loudly,
+        // with ids, goals and the way out. This is the exact scenario where
+        // trusting the shared solo pointer stitched onto a stranger's thread.
+        let cwd = repo_dir.to_str().unwrap();
+        let err = heddle.resolve_bare_target(cwd).unwrap_err();
+        for needle in [
+            da.thread.id.as_str(),
+            db.thread.id.as_str(),
+            da.lease.id.as_str(),
+            db.lease.id.as_str(),
+            "restyle main",
+            "reword readme",
+            "--lease",
+        ] {
+            assert!(err.contains(needle), "refusal must name '{needle}':\n{err}");
+        }
+        // Alice weaves; Bob is then the only live thread — bare resolves
+        // again (woven threads never count toward ambiguity).
+        heddle.stitch(&da.lease.id).expect("stitch a");
+        let p = heddle.propose(&da.thread.id).expect("propose a");
+        heddle.land_weave(&p.weave.id).expect("land a");
+        let (_, t) = heddle.resolve_bare_target(cwd).expect("one live thread left");
+        assert_eq!(t.id, db.thread.id);
+    }
+
+    #[test]
+    fn bare_target_with_no_live_threads_says_lease_first() {
+        let (heddle, repo_dir, _repo) = rig("bare-none");
+        let err = heddle.resolve_bare_target(repo_dir.to_str().unwrap()).unwrap_err();
+        assert!(err.contains("no live thread"), "{err}");
+        assert!(err.contains("heddle lease"), "{err}");
+        // And an unregistered directory is its own honest error.
+        let stray = scratch("bare-stray");
+        let err = heddle.resolve_bare_target(stray.to_str().unwrap()).unwrap_err();
+        assert!(err.contains("no registered repo"), "{err}");
     }
 
     #[test]
