@@ -176,7 +176,7 @@ pub(crate) fn blob_path(objects: &Path, hash: &str) -> PathBuf {
     objects.join(&hash[..2]).join(hash)
 }
 
-fn write_json_0600(path: &Path, value: &impl serde::Serialize) {
+pub(crate) fn write_json_0600(path: &Path, value: &impl serde::Serialize) {
     let Ok(body) = serde_json::to_string_pretty(value) else {
         return;
     };
