@@ -6,15 +6,19 @@
 //! The standalone CLI is one human (or one agent session) per terminal, and
 //! typing lease ids at every verb would be ceremony. `solo.json` in the heddle
 //! data dir remembers, per repo, the caller's current lease + thread — set
-//! by `heddle lease` and `heddle adopt`, read by `stitch`/`propose`/`withdraw`/
-//! `status`, cleared when the thread weaves.
+//! by `heddle lease` and `heddle adopt`, read by `withdraw`/`status` (the `*`
+//! marker), cleared when the thread weaves.
 //!
 //! This is a *convenience pointer*, not state the engine trusts: every verb
 //! re-validates the ids against the engine, and a stale pointer (thread
 //! woven, lease gone) is reported honestly and dropped rather than silently
-//! recreated. Multiple terminals sharing one data dir share one pointer per
-//! repo — solo mode means one work-line per repo at a time; use explicit ids
-//! (or one data dir per agent via `HEDDLE_DATA`) for anything fancier.
+//! recreated. Multiple terminals sharing one data dir share ONE pointer per
+//! repo — last lease wins — which is why bare `stitch`/`propose`/`export`
+//! deliberately do NOT resolve through it: with several live threads the
+//! pointer may name a *different agent's* thread, and a wrong guess writes
+//! onto a stranger's work-line. Those verbs resolve by worktree-cwd or
+//! only-live-thread instead ([`crate::Heddle::resolve_bare_target`]), and
+//! refuse loudly when ambiguous.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

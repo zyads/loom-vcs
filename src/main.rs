@@ -65,6 +65,11 @@ usage:
                                               heddle_propose, heddle_rebase,
                                               heddle_adopt)
 
+bare verbs: flag-less stitch/propose/rebase/export target the thread whose
+worktree you are standing in, else the repo's ONLY live thread. With several
+live threads heddle refuses and lists them — it never guesses, because a
+wrong guess writes onto another agent's thread.
+
 state: ~/.heddle (override with HEDDLE_DATA)";
 
 fn main() -> ExitCode {
@@ -150,16 +155,32 @@ fn flag_value(rest: &[String], flag: &str) -> Result<Option<String>, String> {
     Ok(None)
 }
 
-/// Resolve which lease+thread a verb addresses: explicit flags win, the
-/// solo pointer covers the everyday single-seat case.
+/// The registered repo for the current directory: the repo containing it,
+/// or — when standing inside a thread's isolated worktree, which lives
+/// OUTSIDE every repo tree — that thread's repo.
+fn ambient_repo(engine: &Heddle) -> Result<RepoConfig, String> {
+    if let Some(repo) = engine.repo_containing(".") {
+        return Ok(repo);
+    }
+    engine.thread_containing(".").map(|(repo, _)| repo).ok_or_else(|| {
+        "no registered repo contains this directory — run `heddle init` here first".to_string()
+    })
+}
+
+/// Resolve which lease+thread a verb addresses: explicit flags win; a bare
+/// verb means the thread whose worktree you are standing in, else the
+/// repo's ONLY live thread. With several live threads and no flag it
+/// refuses with the list rather than guess — the solo pointer is shared
+/// per data dir, so trusting it here is how one agent's stitch lands on
+/// another agent's thread (see [`Heddle::resolve_bare_target`]).
 fn target(
     engine: &Heddle,
     rest: &[String],
 ) -> Result<(RepoConfig, String /*lease*/, String /*thread*/), String> {
     let lease_flag = flag_value(rest, "--lease")?;
     let thread_flag = flag_value(rest, "--thread")?;
-    let repo = current_repo(engine)?;
     if lease_flag.is_some() || thread_flag.is_some() {
+        let repo = ambient_repo(engine)?;
         let snap = engine.snapshot();
         let rs = snap
             .repo_states
@@ -181,8 +202,12 @@ fn target(
             .ok_or_else(|| format!("thread {} has no lease", thread.id))?;
         return Ok((repo, lease, thread.id));
     }
-    let (repo, ptr) = current_pointer(engine)?;
-    Ok((repo, ptr.lease_id, ptr.thread_id))
+    let (repo, thread) = engine.resolve_bare_target(".")?;
+    let lease = thread
+        .lease_id
+        .clone()
+        .ok_or_else(|| format!("thread {} has no lease", thread.id))?;
+    Ok((repo, lease, thread.id))
 }
 
 fn cmd_init(rest: &[String]) -> Result<(), String> {
@@ -331,17 +356,16 @@ fn cmd_config(rest: &[String]) -> Result<(), String> {
 
 fn cmd_export(rest: &[String]) -> Result<(), String> {
     let engine = store();
-    let repo = current_repo(engine)?;
-    // Explicit --thread wins; otherwise the solo pointer's thread. Unlike
-    // stitch/propose this never needs a live lease — woven and orphaned
-    // threads export too.
+    // Explicit --thread wins; otherwise the same bare-verb resolution as
+    // stitch/propose: the worktree you stand in, else the repo's only live
+    // thread, else refuse with the list — never the shared solo pointer,
+    // which may name another agent's thread. Unlike stitch/propose this
+    // never needs a live lease — woven and orphaned threads export too,
+    // addressed by --thread or from inside their worktree.
     let thread_id = match flag_value(rest, "--thread")? {
         Some(id) => id,
-        None => current_pointer(engine).map(|(_, ptr)| ptr.thread_id).map_err(|_| {
-            "no current thread — `heddle export --thread <id>` (see `heddle status`)".to_string()
-        })?,
+        None => engine.resolve_bare_target(".")?.1.id,
     };
-    let _ = repo;
     let out = engine.export_thread(&thread_id)?;
     println!(
         "exported {} stitch commit(s) to branch {}",

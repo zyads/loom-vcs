@@ -128,7 +128,11 @@ Both edit the same file — in their own worktrees, so nothing clobbers. A
 finishes first:
 
 ```bash
-# A (use --lease/--thread ids from the lease output when sharing a terminal):
+# A, from inside A's worktree — a bare verb targets the thread whose
+# worktree you are standing in. Anywhere else, with two live threads,
+# heddle refuses and lists them (pass --lease <id>); it never guesses,
+# because a wrong guess would stitch onto B's thread.
+cd ~/.heddle/<repo>/worktrees/<thread-A>
 heddle stitch          # checkpoint (content-addressed; deletions tracked)
 heddle propose         # verify runs in a scratch copy; on green it asks y/N
 # → woven: 1 files applied

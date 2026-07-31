@@ -118,7 +118,9 @@ fn tools() -> Value {
                 content-addressed, deletions included (you never upload content, and nothing is \
                 written to the repo). Cheap — call every few edits. Also heartbeats the lease.",
             "inputSchema": {"type": "object", "properties": {
-                "lease_id": {"type": "string", "description": "Defaults to the current lease."},
+                "lease_id": {"type": "string", "description": "Defaults to the thread whose \
+                    worktree contains `repo`, else the repo's ONLY live thread; with several \
+                    live threads a bare call is refused with the list — pass YOUR lease id."},
                 "repo": repo_prop,
             }},
         },
@@ -129,7 +131,9 @@ fn tools() -> Value {
                 changed on BOTH sides keep YOUR version and come back as conflicts to review \
                 (the fabric's copy is in the repo tree). Then heddle_stitch and heddle_propose again.",
             "inputSchema": {"type": "object", "properties": {
-                "thread_id": {"type": "string", "description": "Defaults to the current thread."},
+                "thread_id": {"type": "string", "description": "Defaults to the thread whose \
+                    worktree contains `repo`, else the repo's ONLY live thread; ambiguous \
+                    bare calls are refused with the list."},
                 "repo": repo_prop,
             }},
         },
@@ -141,7 +145,9 @@ fn tools() -> Value {
                 terminal, so the apply is always refused here and the thread returns to active, \
                 re-proposable. Honest summary: proposing verifies; it never lands.",
             "inputSchema": {"type": "object", "properties": {
-                "thread_id": {"type": "string", "description": "Defaults to the current thread."},
+                "thread_id": {"type": "string", "description": "Defaults to the thread whose \
+                    worktree contains `repo`, else the repo's ONLY live thread; ambiguous \
+                    bare calls are refused with the list."},
                 "repo": repo_prop,
             }},
         },
@@ -175,6 +181,16 @@ fn holder() -> String {
         .filter(|u| !u.trim().is_empty())
         .map(|u| format!("{u} (mcp agent)"))
         .unwrap_or_else(|| "mcp agent".to_string())
+}
+
+/// Bare-call targeting (no lease_id/thread_id): the same rule as the CLI —
+/// the thread whose worktree contains the `repo` path (pass your working_dir
+/// to be unambiguous), else the repo's ONLY live thread, else an honest
+/// refusal listing the candidates. The shared solo pointer is deliberately
+/// NOT consulted: with several agents on one data dir it may name another
+/// agent's thread.
+fn bare_target(engine: &Heddle, args: &Value) -> Result<(heddle::RepoConfig, heddle::Thread), String> {
+    engine.resolve_bare_target(arg(args, "repo").unwrap_or("."))
 }
 
 fn call(engine: &Heddle, name: &str, args: &Value) -> Result<String, String> {
@@ -248,12 +264,9 @@ fn call(engine: &Heddle, name: &str, args: &Value) -> Result<String, String> {
             .to_string())
         }
         "heddle_rebase" => {
-            let repo = repo_of(engine, args)?;
             let thread_id = match arg(args, "thread_id") {
                 Some(t) => t.to_string(),
-                None => solo::get(&engine.base(), &repo.id)
-                    .ok_or("no current thread in this repo — heddle_lease first")?
-                    .thread_id,
+                None => bare_target(engine, args)?.1.id,
             };
             let out = engine.rebase_thread(&thread_id)?;
             Ok(json!({
@@ -275,12 +288,15 @@ fn call(engine: &Heddle, name: &str, args: &Value) -> Result<String, String> {
             .to_string())
         }
         "heddle_stitch" => {
-            let repo = repo_of(engine, args)?;
-            let lease_id = match arg(args, "lease_id") {
-                Some(l) => l.to_string(),
-                None => solo::get(&engine.base(), &repo.id)
-                    .ok_or("no current lease in this repo — heddle_lease first")?
-                    .lease_id,
+            let (repo, lease_id) = match arg(args, "lease_id") {
+                Some(l) => (repo_of(engine, args)?, l.to_string()),
+                None => {
+                    let (repo, thread) = bare_target(engine, args)?;
+                    let lease = thread
+                        .lease_id
+                        .ok_or_else(|| format!("thread {} has no lease", thread.id))?;
+                    (repo, lease)
+                }
             };
             engine.heartbeat(&lease_id)?;
             let out = engine.stitch(&lease_id)?;
@@ -295,12 +311,12 @@ fn call(engine: &Heddle, name: &str, args: &Value) -> Result<String, String> {
             .to_string())
         }
         "heddle_propose" => {
-            let repo = repo_of(engine, args)?;
-            let thread_id = match arg(args, "thread_id") {
-                Some(t) => t.to_string(),
-                None => solo::get(&engine.base(), &repo.id)
-                    .ok_or("no current thread in this repo — heddle_lease first")?
-                    .thread_id,
+            let (repo, thread_id) = match arg(args, "thread_id") {
+                Some(t) => (repo_of(engine, args)?, t.to_string()),
+                None => {
+                    let (repo, thread) = bare_target(engine, args)?;
+                    (repo, thread.id)
+                }
             };
             match engine.propose_with_consent(&thread_id, &AutoDeny)? {
                 WeaveDisposition::Red { weave, .. } => Ok(json!({
