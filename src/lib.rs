@@ -69,7 +69,9 @@
 
 pub mod bridge;
 pub mod consent;
+pub mod enroll;
 pub mod lease;
+pub mod savings;
 pub mod solo;
 pub mod store;
 pub mod sync;
@@ -119,6 +121,7 @@ pub const MAX_THREADS_PER_REPO: usize = 200;
 pub const MAX_STITCHES_PER_THREAD: usize = 200;
 pub const MAX_WEAVES_PER_REPO: usize = 500;
 pub const MAX_TOE_STEPS: usize = 100;
+pub const MAX_OVERLAP_EDITS: usize = 200;
 
 // ---------------------------------------------------------------------------
 // Object model — all objects carry ids and serialize cleanly, so the same
@@ -390,6 +393,23 @@ pub struct ToeStep {
     pub suggested_split: Vec<String>,
 }
 
+/// Two live threads found EDITING the same file at the same time — not just
+/// leasing overlapping globs (that is a [`ToeStep`]), but both actually
+/// diverging from their bases on the same path. Without per-thread worktrees
+/// this is precisely the moment one write clobbers the other; with them it is
+/// a non-event, recorded here so `heddle savings` can count what the
+/// isolation absorbed instead of asserting it. Detected at stitch time,
+/// deduplicated per unordered thread pair; `files` only ever grows.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct OverlapEdit {
+    pub ts_ms: u64,
+    /// The pair, sorted so (a, b) and (b, a) are the same record.
+    pub thread_a: String,
+    pub thread_b: String,
+    /// Repo-relative paths both threads changed while both were live.
+    pub files: Vec<String>,
+}
+
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
@@ -428,6 +448,10 @@ pub struct RepoState {
     pub weaves: Vec<Weave>,
     #[serde(default)]
     pub toe_steps: Vec<ToeStep>,
+    /// Same-file concurrent edits the worktree isolation absorbed
+    /// ([`OverlapEdit`]); serde-default so pre-metrics state files load.
+    #[serde(default)]
+    pub overlap_edits: Vec<OverlapEdit>,
     #[serde(default)]
     pub fabric: Fabric,
     #[serde(default)]
@@ -1470,6 +1494,19 @@ impl Heddle {
                     "ts_ms": now, "kind": "stitch", "stitch": stitch.id,
                     "thread": thread_id, "files": stitch.files.len(),
                 }),
+            );
+            // The metric moment: is any OTHER live thread editing the same
+            // files right now? With isolation that is a non-event — record
+            // it as one, so `heddle savings` counts what was absorbed
+            // instead of asserting it.
+            record_overlap_edits(
+                rs,
+                base,
+                &repo.id,
+                &thread_id,
+                &manifest,
+                base_manifest.as_ref(),
+                now,
             );
             Ok(StitchOutcome {
                 stitch,
@@ -2754,6 +2791,101 @@ fn reconcile_repo(s: &mut HeddleState, repo_id: &str, now: u64, base: &PathBuf) 
     }
 }
 
+/// The head-vs-base delta of one thread: the repo-relative paths it actually
+/// changed. A tombstone counts only when the base HAD the file (deleting
+/// what never existed is not an edit).
+fn changed_vs_base(
+    head: &BTreeMap<String, String>,
+    base: &BTreeMap<String, String>,
+) -> std::collections::BTreeSet<String> {
+    head.iter()
+        .filter(|(rel, h)| {
+            if h.as_str() == TOMBSTONE {
+                base.contains_key(*rel)
+            } else {
+                base.get(*rel) != Some(*h)
+            }
+        })
+        .map(|(rel, _)| rel.clone())
+        .collect()
+}
+
+/// Record same-file concurrent edits ([`OverlapEdit`]) for the thread that
+/// just stitched. Isolated threads only — an in-place thread's captures
+/// cannot be told apart from its edits, so it is skipped rather than
+/// over-counted (a savings metric that inflates itself is worthless).
+/// Deduplicated per unordered thread pair: each file is recorded (and its
+/// `conflicting_edits_avoided` event logged) exactly once per pair.
+fn record_overlap_edits(
+    rs: &mut RepoState,
+    base: &Path,
+    repo_id: &str,
+    thread_id: &str,
+    head_manifest: &BTreeMap<String, String>,
+    base_manifest: Option<&BTreeMap<String, String>>,
+    now: u64,
+) {
+    let Some(mine_base) = base_manifest else { return };
+    let mine = changed_vs_base(head_manifest, mine_base);
+    if mine.is_empty() {
+        return;
+    }
+    // Immutable pass: every other live isolated thread's own delta.
+    let others: Vec<(String, std::collections::BTreeSet<String>)> = rs
+        .threads
+        .iter()
+        .filter(|t| t.id != thread_id && t.status.is_live())
+        .filter_map(|t| {
+            let ob = rs.stitches.iter().find(|s| Some(&s.id) == t.base_stitch.as_ref())?;
+            let oh = rs.stitches.iter().find(|s| Some(&s.id) == t.head_stitch.as_ref())?;
+            let changed = changed_vs_base(&oh.files, &ob.files);
+            (!changed.is_empty()).then(|| (t.id.clone(), changed))
+        })
+        .collect();
+    for (other_id, theirs) in others {
+        let hits: Vec<String> = mine.iter().filter(|rel| theirs.contains(*rel)).cloned().collect();
+        if hits.is_empty() {
+            continue;
+        }
+        let (a, b) = if thread_id < other_id.as_str() {
+            (thread_id.to_string(), other_id)
+        } else {
+            (other_id, thread_id.to_string())
+        };
+        let entry = match rs
+            .overlap_edits
+            .iter_mut()
+            .find(|o| o.thread_a == a && o.thread_b == b)
+        {
+            Some(e) => e,
+            None => {
+                rs.overlap_edits.push(OverlapEdit {
+                    ts_ms: now,
+                    thread_a: a.clone(),
+                    thread_b: b.clone(),
+                    files: Vec::new(),
+                });
+                rs.overlap_edits.last_mut().expect("pushed above")
+            }
+        };
+        let fresh: Vec<String> = hits.into_iter().filter(|f| !entry.files.contains(f)).collect();
+        if fresh.is_empty() {
+            continue;
+        }
+        entry.files.extend(fresh.iter().cloned());
+        entry.ts_ms = now;
+        store::append_event(
+            base,
+            repo_id,
+            &serde_json::json!({
+                "ts_ms": now, "kind": "conflicting_edits_avoided",
+                "thread_a": a, "thread_b": b,
+                "files": fresh, "count": fresh.len(),
+            }),
+        );
+    }
+}
+
 /// A thread's stitch chain, oldest first, walked from `head` through
 /// `parent` links. A pruned parent ends the walk. The thread's base stitch
 /// (worktree snapshot) is never in this chain — it has no parent link from
@@ -2833,6 +2965,9 @@ fn prune(s: &mut HeddleState) {
         }
         while rs.toe_steps.len() > MAX_TOE_STEPS {
             rs.toe_steps.remove(0);
+        }
+        while rs.overlap_edits.len() > MAX_OVERLAP_EDITS {
+            rs.overlap_edits.remove(0);
         }
     }
 }

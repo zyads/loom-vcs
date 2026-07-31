@@ -28,12 +28,14 @@ heddle — version control for many hands moving at once (docs/DESIGN.md)
 usage:
   heddle init [--verify CMD] [--git-bridge]     register the current directory
        [--bridge-mode squash|stitches|both]   (bridge granularity; default
-                                              squash — one commit per weave)
+       [--no-adopt]                           squash — one commit per weave)
                                               CMD runs on EVERY propose and
                                               every agent waits for it: point
                                               it at a fast subset (a few
                                               seconds), not the full suite —
-                                              leave that to CI.
+                                              leave that to CI. Also enrolls
+                                              the repo's agents (see `heddle
+                                              adopt` below); --no-adopt skips.
   heddle config [--bridge-mode MODE]            show this repo's config, or set
                                               the git-bridge granularity
   heddle lease \"<goal>\" <scope...>              declare an intent lease; on a git
@@ -50,6 +52,24 @@ usage:
   heddle withdraw                               return a proposed thread to active
   heddle adopt <thread-id>                      take over an orphaned thread
                                               (local, or a synced peer's)
+  heddle adopt [--dry-run]                      (no thread id) wire THIS repo so
+                                              agents pick heddle up unprompted:
+                                              .mcp.json (MCP server) +
+                                              .claude/settings.json (approval,
+                                              SessionStart hook) + CLAUDE.md
+                                              (rules). Shows everything before
+                                              writing; idempotent; --dry-run
+                                              prints and writes nothing.
+  heddle savings [--json]                       did heddle earn its keep here?
+                                              counted facts (collisions warned,
+                                              same-file edits absorbed, refused
+                                              lands, rebases), then ONE labeled
+                                              estimate with its constants shown
+                                              — honest, including \"nothing
+                                              measurable was prevented\".
+  heddle savings --record-tokens ID N           attach a real token count to
+                                              thread ID; recorded ground truth
+                                              replaces the estimate's assumption
   heddle clean                                  remove worktrees of woven threads
                                               (refuses uncaptured divergence)
   heddle sync [--remote NAME] [--auto on|off]   sync leases/threads/fabric with a
@@ -58,7 +78,10 @@ usage:
                                               refuses a remote anyone can read
                                               unless you pass --anyway.
   heddle repair [--scan <dir>] [--dry-run]      rebind repos that moved on disk
-  heddle status                                 threads, leases, orphans, peers
+  heddle status [--brief]                       threads, leases, orphans, peers
+                                              (--brief: a few lines for session
+                                              hooks — silent when nothing is
+                                              live, silent outside any repo)
   heddle log                                    fabric history + recent events
   heddle mcp                                    stdio MCP server (heddle_status,
                                               heddle_lease, heddle_stitch,
@@ -92,7 +115,8 @@ fn main() -> ExitCode {
         "clean" => cmd_clean(),
         "repair" => cmd_repair(rest),
         "sync" => cmd_sync(rest),
-        "status" => cmd_status(),
+        "savings" => cmd_savings(rest),
+        "status" => cmd_status(rest),
         "log" => cmd_log(),
         "mcp" => {
             mcp::serve(store());
@@ -214,6 +238,7 @@ fn cmd_init(rest: &[String]) -> Result<(), String> {
     let mut verify = None;
     let mut git_bridge = false;
     let mut bridge_mode = None;
+    let mut no_adopt = false;
     let mut it = rest.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -231,6 +256,7 @@ fn cmd_init(rest: &[String]) -> Result<(), String> {
                     .ok_or_else(|| "--bridge-mode needs squash | stitches | both".to_string())?;
                 bridge_mode = Some(v.parse::<heddle::BridgeMode>()?);
             }
+            "--no-adopt" => no_adopt = true,
             other => return Err(format!("unknown init flag '{other}'")),
         }
     }
@@ -243,8 +269,108 @@ fn cmd_init(rest: &[String]) -> Result<(), String> {
     println!("  verify:     {}", repo.verify_cmd);
     println!("  git bridge: {}", bridge_line(&repo));
     println!("  data:       {}", engine.base().display());
+    if !no_adopt {
+        println!();
+        enroll_repo(std::path::Path::new(&repo.path), false)?;
+    }
     if let Some(note) = time_the_verify(&repo) {
         println!("{note}");
+    }
+    Ok(())
+}
+
+/// Enroll a repo's agents (`heddle init`, and thread-less `heddle adopt`):
+/// plan the three files, show exactly what each will contain, then — unless
+/// this is a dry run — write and say what was added vs already present.
+fn enroll_repo(root: &std::path::Path, dry_run: bool) -> Result<(), String> {
+    let plan = heddle::enroll::plan(root)?;
+    println!("agent enrollment — agents in this repo pick heddle up unprompted:");
+    for f in &plan.files {
+        let state = if !f.changed {
+            "unchanged"
+        } else if f.existed {
+            "will be updated"
+        } else {
+            "will be created"
+        };
+        println!("  {} ({state})", f.path.display());
+        for a in &f.added {
+            println!("    + {a}");
+        }
+        for a in &f.already {
+            println!("    = already present: {a}");
+        }
+        if f.changed {
+            let label = if f.path.ends_with("CLAUDE.md") {
+                "the managed block (the rest of the file is untouched):"
+            } else {
+                "full content after the write:"
+            };
+            println!("    {label}");
+            for line in f.display.lines() {
+                println!("    | {line}");
+            }
+        }
+    }
+    if dry_run {
+        println!("dry run — nothing was written");
+        return Ok(());
+    }
+    if !plan.any_changes() {
+        println!("everything already in place — nothing to write");
+        return Ok(());
+    }
+    let written = plan.apply()?;
+    println!(
+        "wrote {} file(s) — re-running is safe (idempotent); `heddle adopt --dry-run` previews",
+        written.len()
+    );
+    Ok(())
+}
+
+fn cmd_savings(rest: &[String]) -> Result<(), String> {
+    let mut json = false;
+    let mut record: Option<(String, u64)> = None;
+    let mut it = rest.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--json" => json = true,
+            "--record-tokens" => {
+                let t = it
+                    .next()
+                    .ok_or_else(|| "--record-tokens needs <thread-id> <tokens>".to_string())?;
+                let n = it
+                    .next()
+                    .ok_or_else(|| "--record-tokens needs <thread-id> <tokens>".to_string())?;
+                let n = n
+                    .parse::<u64>()
+                    .map_err(|_| format!("bad token count '{n}' — a plain number of tokens"))?;
+                record = Some((t.clone(), n));
+            }
+            other => return Err(format!("unknown savings flag '{other}'")),
+        }
+    }
+    let engine = store();
+    let repo = current_repo(engine)?;
+    if let Some((thread, n)) = record {
+        let gt = heddle::savings::record_tokens(engine, &repo.id, &thread, n)?;
+        println!(
+            "recorded {} tokens for {thread} — {} thread(s) have ground truth now (median {})",
+            heddle::savings::thousands(n),
+            gt.recorded.len(),
+            gt.median.map(heddle::savings::thousands).unwrap_or_default(),
+        );
+        println!("the savings estimate uses your recorded medians instead of an assumption");
+        return Ok(());
+    }
+    let report = heddle::savings::compute(engine, &repo);
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).map_err(|e| format!("serialize: {e}"))?
+        );
+    } else {
+        print!("{}", report.render());
     }
     Ok(())
 }
@@ -697,10 +823,28 @@ fn cmd_withdraw() -> Result<(), String> {
     Ok(())
 }
 
+/// Two meanings, split by the argument shape: `heddle adopt <thread-id>`
+/// takes over an orphaned thread (the original verb); `heddle adopt` with no
+/// thread id adopts HEDDLE into the repo — (re)applies the agent enrollment
+/// that `heddle init` performs, for repos initialized before it existed or
+/// whose config drifted. `--dry-run` only makes sense for the latter.
 fn cmd_adopt(rest: &[String]) -> Result<(), String> {
-    let thread_id = rest
-        .first()
-        .ok_or_else(|| "usage: heddle adopt <thread-id> (see `heddle status` for orphans)".to_string())?;
+    let dry_run = rest.iter().any(|a| a == "--dry-run" || a == "-n");
+    let thread_id = match rest.iter().find(|a| !a.starts_with('-')) {
+        Some(t) => t,
+        None => {
+            let engine = store();
+            let repo = current_repo(engine)?;
+            return enroll_repo(std::path::Path::new(&repo.path), dry_run);
+        }
+    };
+    if dry_run {
+        return Err(
+            "--dry-run applies to repo enrollment (`heddle adopt` with NO thread id); \
+             adopting an orphan either happens or it doesn't"
+                .to_string(),
+        );
+    }
     let engine = store();
     // Local first; unknown thread + a sync remote → try the claims flow.
     let (thread, lease) = match engine.adopt(thread_id, &holder()) {
@@ -732,7 +876,10 @@ fn cmd_adopt(rest: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn cmd_status() -> Result<(), String> {
+fn cmd_status(rest: &[String]) -> Result<(), String> {
+    if rest.iter().any(|a| a == "--brief") {
+        return cmd_status_brief();
+    }
     let engine = store();
     let repo = current_repo(engine)?;
     let snap = engine.snapshot();
@@ -837,6 +984,59 @@ fn cmd_status() -> Result<(), String> {
             }
         }
     }
+    Ok(())
+}
+
+/// `heddle status --brief` — written for SessionStart hooks, whose stdout
+/// lands straight in an agent's context. The contract is spend-nothing-when-
+/// there-is-nothing: outside any registered repo, or with no live threads
+/// and no orphans, it prints NOTHING and exits 0 (a hook that errors or
+/// chatters at every session start gets deleted, and deserves it).
+fn cmd_status_brief() -> Result<(), String> {
+    let engine = store();
+    let Some(repo) = engine.repo_containing(".") else {
+        return Ok(());
+    };
+    let snap = engine.snapshot();
+    let rs = snap.repo_states.get(&repo.id).cloned().unwrap_or_default();
+    let live: Vec<_> = rs.threads.iter().filter(|t| t.status.is_live()).collect();
+    let orphans: Vec<_> = rs
+        .threads
+        .iter()
+        .filter(|t| t.status == ThreadStatus::Orphaned)
+        .collect();
+    if live.is_empty() && orphans.is_empty() {
+        return Ok(());
+    }
+    if !live.is_empty() {
+        println!(
+            "heddle: {} live thread(s) in this repo — their scopes are TAKEN; lease before editing:",
+            live.len()
+        );
+        for t in &live {
+            let scope = t
+                .lease_id
+                .as_ref()
+                .and_then(|lid| rs.leases.iter().find(|l| l.id == *lid))
+                .map(|l| l.scope.join(" "))
+                .unwrap_or_default();
+            println!("  {} [{:?}] {} — scope: {}", t.id, t.status, t.goal, scope);
+        }
+    }
+    // Orphans are capped hard: a repo can hold dozens of finished-and-lapsed
+    // threads, and a hook that injects thirty lines into every session start
+    // is a hook that gets deleted. Newest first — most likely still warm.
+    const MAX_BRIEF_ORPHANS: usize = 3;
+    for t in orphans.iter().rev().take(MAX_BRIEF_ORPHANS) {
+        println!("  orphan {} — {} (take it over: heddle adopt {})", t.id, t.goal, t.id);
+    }
+    if orphans.len() > MAX_BRIEF_ORPHANS {
+        println!(
+            "  …and {} more orphaned thread(s) — `heddle status` lists them all",
+            orphans.len() - MAX_BRIEF_ORPHANS
+        );
+    }
+    println!("  (self-partition around those scopes; detail: heddle status)");
     Ok(())
 }
 
