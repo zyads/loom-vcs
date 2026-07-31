@@ -283,7 +283,11 @@ content-addressed whole-file blobs under `~/.heddle` (override `HEDDLE_DATA`),
   engine never shells git itself.
 - `heddle` CLI: `init · config · lease · stitch · propose · export · rebase ·
   withdraw · adopt · clean · sync · status · log · mcp`, with
-  `--lease/--thread` overrides for multi-seat terminals.
+  `--lease/--thread` overrides for multi-seat terminals. Bare (flag-less)
+  verbs resolve to the thread whose worktree contains the cwd, else the
+  repo's only live thread; with several live threads they refuse with the
+  list — never a guess, because a guess writes onto another agent's thread
+  (the shared solo pointer is a display convenience, not targeting truth).
 - `heddle mcp`: stdio MCP server — `heddle_status · heddle_lease · heddle_stitch ·
   heddle_propose · heddle_rebase · heddle_adopt`. Proposing verifies; landing
   always requires the human path.
